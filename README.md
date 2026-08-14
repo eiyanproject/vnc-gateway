@@ -86,7 +86,11 @@ The gates were exercised against the running stack:
 | WebSocket upgrade, forged `sid` | 401 |
 | WebSocket upgrade, valid `sid` | accepted, guacd creates a VNC client |
 | Same `sid` replayed | 401 |
+| `POST /api/sessions` for `192.168.1.50:5900` | 200 (in `ALLOWED_CIDRS`) |
 | `POST /api/sessions` for `8.8.8.8` | 403, logged as DENIED |
+| `POST /api/sessions` for `192.168.2.50` | 403, adjacent subnet |
+| `POST /api/sessions` for `192.168.1.50:22` | 403, port not allowed |
+| `POST /api/sessions` for a hostname | 403, DNS-rebinding guard |
 | `GET /api/connections` | labels + IDs only, no hostname or password |
 | guacd port 4822 from the host | not reachable |
 
@@ -97,11 +101,41 @@ running on the Windows box.
 
 ## Stage 2 — deploy to the Proxmox LXC
 
-See [docs/lxc-setup.md](docs/lxc-setup.md). Docker in an unprivileged LXC needs
-two container flags; that document covers them and the failure modes.
+On a fresh Debian LXC, as root:
 
-Change `connections.json` to the Windows LAN IP, and confirm you can reach it
-from another machine on the LAN.
+```bash
+curl -fsSL https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/install.sh | bash
+```
+
+Then edit `/opt/vnc-gateway/connections.json` — set `hostname` to the Windows
+box's LAN IP — and restart:
+
+```bash
+docker compose -f /opt/vnc-gateway/docker-compose.yml restart app
+```
+
+### Updating
+
+Re-run the same script. That *is* the update path:
+
+```bash
+bash /opt/vnc-gateway/install.sh
+```
+
+It is idempotent. It pulls the latest source, rebuilds, and:
+
+- **keeps** your `.env`, your generated `TOKEN_ENCRYPTION_KEY`, and your
+  `connections.json`
+- **adds** any new setting that has appeared in `.env.example` since you
+  installed, so new options arrive without clobbering your values
+- checks the Proxmox `nesting=1,keyctl=1` flags up front, because without them
+  Docker installs cleanly and then fails at the first `docker run` — which is a
+  confusing way to find out
+
+Overrides: `VNCGW_DIR` (default `/opt/vnc-gateway`), `VNCGW_REPO`, `VNCGW_REF`.
+
+Manual setup, and the detail on the LXC feature flags, is in
+[docs/lxc-setup.md](docs/lxc-setup.md).
 
 ## Stage 3 — Cloudflare Tunnel + Access
 

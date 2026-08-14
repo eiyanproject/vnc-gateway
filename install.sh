@@ -41,9 +41,12 @@ if grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || [ -f /run/.containere
 fi
 
 # --- 2. Dependencies --------------------------------------------------------
+# Only probe things that are actually binaries. ca-certificates is a package,
+# not a command, so testing it with `command -v` always fails and would drag in
+# a full apt-get update on every single run.
 need_apt_update=0
-for pkg in git curl ca-certificates; do
-  command -v "$pkg" >/dev/null 2>&1 || need_apt_update=1
+for bin in git curl; do
+  command -v "$bin" >/dev/null 2>&1 || need_apt_update=1
 done
 
 if [ "$need_apt_update" -eq 1 ]; then
@@ -104,13 +107,23 @@ while IFS= read -r line; do
       ;;
   esac
 done < .env.example
-[ -n "$added" ] && say "Added new settings to .env:$added"
+# Written as a full `if` rather than `[ -n "$added" ] && say ...`, because under
+# `set -e` a trailing && list whose test fails takes the whole script down.
+if [ -n "$added" ]; then
+  say "Added new settings to .env:$added"
+fi
 
 # The token key must be exactly 32 bytes. Restrict to alphanumerics so the value
 # never needs quoting in .env or escaping in sed.
 if grep -q '^TOKEN_ENCRYPTION_KEY=CHANGE_ME' .env || ! grep -q '^TOKEN_ENCRYPTION_KEY=.\{32\}$' .env; then
   say "Generating TOKEN_ENCRYPTION_KEY ..."
-  newkey="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)"
+  # Deliberately NOT `tr -dc ... < /dev/urandom | head -c 32`. /dev/urandom never
+  # ends, so head exits first, tr dies of SIGPIPE, and `set -o pipefail` turns
+  # that into a silent early exit -- intermittently, depending on who wins the
+  # race. Read a bounded chunk and slice it in the shell instead.
+  raw="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  newkey="${raw:0:32}"
+  [ "${#newkey}" -eq 32 ] || die "could not generate a 32-character key (got ${#newkey})"
   sed -i "s|^TOKEN_ENCRYPTION_KEY=.*|TOKEN_ENCRYPTION_KEY=${newkey}|" .env
 else
   say "Keeping existing TOKEN_ENCRYPTION_KEY."
@@ -147,7 +160,7 @@ else
   warn "App did not answer /api/health within 30s. Check: docker compose -f $VNCGW_DIR/docker-compose.yml logs"
 fi
 
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 cat <<EOF
 
   URL          http://${IP:-<this-host>}:${HOST_PORT}
