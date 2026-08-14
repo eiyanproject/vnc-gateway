@@ -1,0 +1,4 @@
+# Authored on Windows, runs on Linux. Without this, install.sh is checked out
+# with CRLF line endings and the LXC greets you with:
+#     bash: install.sh: /usr/bin/env bash^M: bad interpreter
+* text=auto eol=lf

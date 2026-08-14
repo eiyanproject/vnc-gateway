@@ -1,0 +1,9 @@
+[
+  {
+    "id": "windows-desktop",
+    "label": "Windows 11 desktop",
+    "hostname": "host.docker.internal",
+    "port": 5900,
+    "password": "your-vnc-password"
+  }
+]

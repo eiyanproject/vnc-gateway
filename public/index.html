@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>VNC Gateway</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="bar">
+    <strong>VNC Gateway</strong>
+    <span id="status" class="status">idle</span>
+    <span class="spacer"></span>
+    <button id="cad" hidden>Ctrl-Alt-Del</button>
+    <button id="disconnect" hidden>Disconnect</button>
+    <span id="whoami" class="who"></span>
+  </header>
+
+  <main id="picker">
+    <h2>Saved connections</h2>
+    <ul id="connections"></ul>
+
+    <section id="freeform" hidden>
+      <h2>Connect to an address</h2>
+      <p class="hint">Restricted to the CIDRs and ports set in <code>ALLOWED_CIDRS</code>.</p>
+      <form id="adhoc">
+        <input id="host" placeholder="192.168.1.50" autocomplete="off" required>
+        <input id="port" placeholder="5900" value="5900" size="6" autocomplete="off">
+        <input id="password" type="password" placeholder="VNC password" autocomplete="off">
+        <button type="submit">Connect</button>
+      </form>
+    </section>
+
+    <p id="error" class="error" hidden></p>
+  </main>
+
+  <div id="display"></div>
+
+  <script src="vendor/guacamole-common.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+services:
+  guacd:
+    image: guacamole/guacd:1.5.5
+    container_name: vncgw-guacd
+    restart: unless-stopped
+    networks: [vncgw]
+    # NOTE: no `ports:` on purpose. guacd must never be reachable from outside
+    # this compose network -- it has no authentication of any kind.
+    extra_hosts:
+      # guacd is the process that actually opens the RFB/TCP connection, so the
+      # target hostname must resolve *here*. This mapping makes the literal name
+      # "host.docker.internal" point at the Docker host machine on Linux too.
+      - "host.docker.internal:host-gateway"
+
+  app:
+    build: .
+    container_name: vncgw-app
+    restart: unless-stopped
+    depends_on: [guacd]
+    networks: [vncgw]
+    env_file: .env
+    environment:
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+    ports:
+      # STAGE 1 (local): published so you can hit http://localhost:<HOST_PORT>.
+      # STAGE 3 (cloudflare): change to "127.0.0.1:${HOST_PORT}:8080" so only
+      # cloudflared can reach it.
+      - "${HOST_PORT:-8088}:8080"
+    volumes:
+      - ./connections.json:/app/connections.json:ro
+
+networks:
+  vncgw:
+    driver: bridge
