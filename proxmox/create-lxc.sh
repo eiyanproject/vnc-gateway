@@ -58,12 +58,17 @@ TEMPLATE_STORE="${TEMPLATE_STORE:-$(pvesm status --content vztmpl | awk 'NR>1 &&
 say "rootfs storage:   $ROOT_STORE"
 say "template storage: $TEMPLATE_STORE"
 
-# guacd only has arm64 images from 1.6.0 onward; docker-compose.yml pins that.
-HOST_ARCH="$(uname -m)"
-case "$HOST_ARCH" in
-  x86_64|amd64|aarch64|arm64) say "host architecture: $HOST_ARCH" ;;
-  *) warn "host architecture is '$HOST_ARCH'; guacd publishes amd64 and arm64 only." ;;
-esac
+# Templates are named with dpkg architecture strings (amd64 / arm64), which is
+# exactly what `dpkg --print-architecture` reports -- so use it directly.
+HOST_DEB_ARCH="${HOST_DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || true)}"
+if [ -z "$HOST_DEB_ARCH" ]; then
+  case "$(uname -m)" in
+    x86_64)          HOST_DEB_ARCH=amd64 ;;
+    aarch64|arm64)   HOST_DEB_ARCH=arm64 ;;
+    *)               HOST_DEB_ARCH=amd64 ;;
+  esac
+fi
+say "host architecture: $HOST_DEB_ARCH"
 
 # --- ZFS / overlayfs check --------------------------------------------------
 # Docker's overlay2 driver could not run on ZFS-backed container rootfs until
@@ -113,14 +118,49 @@ say "container ID: $CTID"
 say "Refreshing template list..."
 pveam update >/dev/null
 
+# MUST filter by architecture. `pveam available` lists every arch the mirror
+# carries, and "amd64" sorts before "arm64" -- so an unfiltered `sort -V | tail -1`
+# picks the arm64 template on an amd64 host. The container then creates fine and
+# fails at start with "sync_wait: 34 ... Failed to spawn container", because an
+# arm64 rootfs cannot exec its init on an amd64 kernel.
+pick_template() {
+  local series="$1" arch="$2"
+  pveam available --section system \
+    | awk '{print $2}' \
+    | grep -E "^${series}_.*_${arch}\.tar\." \
+    | sort -V \
+    | tail -1
+}
+
 TEMPLATE_NAME=""
 for series in debian-13-standard debian-12-standard; do
-  TEMPLATE_NAME="$(pveam available --section system | awk '{print $2}' | grep -E "^${series}" | sort -V | tail -1 || true)"
+  TEMPLATE_NAME="$(pick_template "$series" "$HOST_DEB_ARCH" || true)"
   if [ -n "$TEMPLATE_NAME" ]; then
     break
   fi
 done
-[ -n "$TEMPLATE_NAME" ] || die "could not find a Debian 12/13 template in 'pveam available'"
+
+# Fall back to amd64 rather than giving up: it is the right answer on any host
+# where the architecture probe came back empty or odd.
+if [ -z "$TEMPLATE_NAME" ] && [ "$HOST_DEB_ARCH" != "amd64" ]; then
+  warn "No Debian template found for '$HOST_DEB_ARCH'; falling back to amd64."
+  HOST_DEB_ARCH=amd64
+  for series in debian-13-standard debian-12-standard; do
+    TEMPLATE_NAME="$(pick_template "$series" amd64 || true)"
+    if [ -n "$TEMPLATE_NAME" ]; then
+      break
+    fi
+  done
+fi
+
+[ -n "$TEMPLATE_NAME" ] || die "could not find a Debian 12/13 ${HOST_DEB_ARCH} template in 'pveam available'"
+
+# Belt and braces: never hand pct a template for the wrong architecture.
+case "$TEMPLATE_NAME" in
+  *_${HOST_DEB_ARCH}.tar.*) ;;
+  *) die "template '$TEMPLATE_NAME' does not match host architecture ${HOST_DEB_ARCH}" ;;
+esac
+say "Template: $TEMPLATE_NAME"
 
 if pveam list "$TEMPLATE_STORE" | grep -q "$TEMPLATE_NAME"; then
   say "Template already downloaded: $TEMPLATE_NAME"
