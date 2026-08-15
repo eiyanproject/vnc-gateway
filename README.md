@@ -4,6 +4,10 @@ Browser-based VNC gateway. `guacd` handles the RFB protocol; a small Node app
 owns authentication, target selection, and token minting; the frontend is
 `guacamole-common-js` with no build step.
 
+Runs on **amd64 and arm64**. `guacd` must be 1.6.0 or newer — the 1.5.x images
+are published for amd64 only, so on ARM the pull fails with `no matching
+manifest for linux/arm64`.
+
 Built in stages. **Stage 1 is local-only and has no login** — that is deliberate,
 not an oversight. Get pixels on screen first, then add the perimeter.
 

@@ -1,6 +1,10 @@
 services:
   guacd:
-    image: guacamole/guacd:1.5.5
+    # 1.6.0 or newer is required: guacamole/guacd:1.5.x is published for amd64
+    # ONLY, so on an arm64 host (Proxmox on ARM, Pi, Apple silicon) the pull
+    # fails with "no matching manifest for linux/arm64". 1.6.0 is the first
+    # multi-arch tag.
+    image: guacamole/guacd:1.6.0
     container_name: vncgw-guacd
     restart: unless-stopped
     networks: [vncgw]
