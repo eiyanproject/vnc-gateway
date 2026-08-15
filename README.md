@@ -86,10 +86,10 @@ The gates were exercised against the running stack:
 | WebSocket upgrade, forged `sid` | 401 |
 | WebSocket upgrade, valid `sid` | accepted, guacd creates a VNC client |
 | Same `sid` replayed | 401 |
-| `POST /api/sessions` for `192.168.1.50:5900` | 200 (in `ALLOWED_CIDRS`) |
+| `POST /api/sessions` for `192.168.0.50:5900` | 200 (in `ALLOWED_CIDRS`) |
 | `POST /api/sessions` for `8.8.8.8` | 403, logged as DENIED |
-| `POST /api/sessions` for `192.168.2.50` | 403, adjacent subnet |
-| `POST /api/sessions` for `192.168.1.50:22` | 403, port not allowed |
+| `POST /api/sessions` for `192.168.9.50` | 403, adjacent subnet |
+| `POST /api/sessions` for `192.168.0.50:22` | 403, port not allowed |
 | `POST /api/sessions` for a hostname | 403, DNS-rebinding guard |
 | `GET /api/connections` | labels + IDs only, no hostname or password |
 | guacd port 4822 from the host | not reachable |
@@ -108,7 +108,7 @@ the recommended specs (2 vCPU / 2 GB / 8 GB, `nesting=1,keyctl=1`, `onboot`),
 then installs vnc-gateway inside it:
 
 ```bash
-CT_IP=192.168.1.20/24 CT_GW=192.168.1.1 bash proxmox/create-lxc.sh
+bash proxmox/create-lxc.sh
 ```
 
 It picks the newest Debian template and an appropriate storage automatically,

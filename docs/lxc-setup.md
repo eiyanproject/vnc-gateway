@@ -11,7 +11,7 @@ On the **Proxmox host**, as root — this creates the container with the
 recommended specs, enables the feature flags, and installs vnc-gateway inside:
 
 ```bash
-CT_IP=192.168.1.20/24 CT_GW=192.168.1.1 bash proxmox/create-lxc.sh
+bash proxmox/create-lxc.sh
 ```
 
 Everything below is what that script does, for when you'd rather do it by hand

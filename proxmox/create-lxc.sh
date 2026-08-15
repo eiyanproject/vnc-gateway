@@ -5,13 +5,14 @@
 #
 # RUN THIS ON THE PROXMOX HOST, as root -- not inside a container.
 #
-#   Static IP (recommended):
-#     CT_IP=192.168.1.20/24 CT_GW=192.168.1.1 bash create-lxc.sh
-#
-#   DHCP (works, but see the warning it prints):
+#   Just run it. It asks for what it needs:
 #     bash create-lxc.sh
 #
-# Overrides:
+#   Or skip the questions (for automation):
+#     CT_IP=192.168.0.30/24 CT_GW=192.168.0.1 bash create-lxc.sh
+#     CT_IP=dhcp bash create-lxc.sh
+#
+# Overrides (all optional; anything unset is prompted for or defaulted):
 #   CTID           container ID            (default: next free)
 #   CT_HOSTNAME    hostname                (default: vnc-gateway)
 #   CT_CORES       vCPUs                   (default: 2)
@@ -32,7 +33,7 @@ CT_RAM="${CT_RAM:-2048}"
 CT_SWAP="${CT_SWAP:-512}"
 CT_DISK="${CT_DISK:-8}"
 CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
-CT_IP="${CT_IP:-dhcp}"
+CT_IP="${CT_IP:-}"
 CT_GW="${CT_GW:-}"
 CT_SSHKEY="${CT_SSHKEY:-}"
 RUN_INSTALLER="${RUN_INSTALLER:-1}"
@@ -123,6 +124,97 @@ fi
 TEMPLATE_REF="${TEMPLATE_STORE}:vztmpl/${TEMPLATE_NAME}"
 
 # --- Network ----------------------------------------------------------------
+valid_ipv4() {
+  case "$1" in
+    *[!0-9.]*|"") return 1 ;;
+  esac
+  local o count=0
+  local IFS=.
+  for o in $1; do
+    count=$((count + 1))
+    case "$o" in ""|*[!0-9]*) return 1 ;; esac
+    [ "$o" -le 255 ] || return 1
+  done
+  [ "$count" -eq 4 ]
+}
+
+# Network address for a given IP + prefix, e.g. 192.168.0.30 24 -> 192.168.0.0/24
+cidr_network() {
+  local ip="$1" bits="$2" a b c d ipint mask net
+  local IFS=.
+  read -r a b c d <<EOF2
+$ip
+EOF2
+  ipint=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+  if [ "$bits" -eq 0 ]; then mask=0; else mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF )); fi
+  net=$(( ipint & mask ))
+  printf '%d.%d.%d.%d/%d\n' $(( (net >> 24) & 255 )) $(( (net >> 16) & 255 )) $(( (net >> 8) & 255 )) $(( net & 255 )) "$bits"
+}
+
+HOST_GW="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}' || true)"
+
+# Ask, rather than making the caller assemble environment variables. Anything
+# already set via the environment is taken as-is, so automation still works.
+if [ -z "$CT_IP" ] && [ -t 0 ]; then
+  echo
+  echo "  How should the container get its address?"
+  echo "    1) Static IP  (recommended -- the Windows firewall rule will point at it)"
+  echo "    2) DHCP"
+  printf '  Choose [1]: '
+  read -r choice || choice=""
+  case "${choice:-1}" in
+    2) CT_IP="dhcp" ;;
+    *)
+      while :; do
+        printf '  IP address for the container (e.g. 192.168.0.30): '
+        read -r ans || ans=""
+        # Accept either a bare IP or one with a prefix already attached.
+        case "$ans" in
+          */*) ipaddr="${ans%%/*}"; prefix="${ans##*/}" ;;
+          *)   ipaddr="$ans"; prefix="" ;;
+        esac
+        if valid_ipv4 "$ipaddr"; then
+          break
+        fi
+        warn "Not a valid IPv4 address: '$ans'"
+      done
+
+      if [ -z "$prefix" ]; then
+        printf '  Prefix length [24]: '
+        read -r prefix || prefix=""
+        prefix="${prefix:-24}"
+      fi
+
+      # Catch the obvious mistake before Proxmox commits to it.
+      if ping -c1 -W1 "$ipaddr" >/dev/null 2>&1; then
+        warn "$ipaddr already answers ping -- something is using it."
+        printf '  Use it anyway? [y/N] '
+        read -r yn || yn=""
+        case "$yn" in
+          [yY]*) ;;
+          *) die "aborted -- re-run and pick a free address" ;;
+        esac
+      fi
+
+      while :; do
+        printf '  Gateway [%s]: ' "${HOST_GW:-192.168.0.1}"
+        read -r gw || gw=""
+        gw="${gw:-${HOST_GW:-192.168.0.1}}"
+        if valid_ipv4 "$gw"; then
+          break
+        fi
+        warn "Not a valid IPv4 address: '$gw'"
+      done
+
+      CT_IP="${ipaddr}/${prefix}"
+      CT_GW="$gw"
+      ;;
+  esac
+  echo
+fi
+
+CT_IP="${CT_IP:-dhcp}"
+
 if [ "$CT_IP" = "dhcp" ]; then
   warn "Using DHCP. Set a reservation for this container on your router."
   warn "The Windows Firewall rule that restricts VNC to this gateway references"
@@ -132,10 +224,13 @@ if [ "$CT_IP" = "dhcp" ]; then
 else
   case "$CT_IP" in
     */*) ;;
-    *) die "CT_IP must include a prefix length, e.g. 192.168.1.20/24" ;;
+    *) die "CT_IP must include a prefix length, e.g. 192.168.0.30/24" ;;
   esac
-  [ -n "$CT_GW" ] || die "CT_GW is required when CT_IP is static, e.g. CT_GW=192.168.1.1"
+  [ -n "$CT_GW" ] || die "CT_GW is required when CT_IP is static, e.g. CT_GW=192.168.0.1"
+  valid_ipv4 "${CT_IP%%/*}" || die "CT_IP is not a valid IPv4 address: ${CT_IP%%/*}"
+  valid_ipv4 "$CT_GW"       || die "CT_GW is not a valid IPv4 address: $CT_GW"
   NET0="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IP},gw=${CT_GW}"
+  say "Static address: ${CT_IP} via ${CT_GW}"
 fi
 
 # --- Credentials ------------------------------------------------------------
@@ -189,6 +284,19 @@ if [ "$RUN_INSTALLER" = "1" ] && [ "$ready" = "1" ]; then
   say "Installing vnc-gateway inside the container (this pulls Docker, give it a few minutes)..."
   pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
   pct exec "$CTID" -- bash -c "curl -fsSL ${INSTALLER_URL} | bash"
+
+  # Point the free-form target allowlist at the network the container actually
+  # landed on. Guessing this in .env.example is how you end up with an allowlist
+  # that silently blocks every real target.
+  CT_CIDR="$(pct exec "$CTID" -- ip -o -4 addr show dev eth0 2>/dev/null | awk '{print $4; exit}' || true)"
+  if [ -n "$CT_CIDR" ] && [ "${CT_CIDR}" != "${CT_CIDR%/*}" ]; then
+    SUBNET="$(cidr_network "${CT_CIDR%%/*}" "${CT_CIDR##*/}")"
+    say "Setting ALLOWED_CIDRS to $SUBNET (the container's own subnet)."
+    pct exec "$CTID" -- sed -i "s|^ALLOWED_CIDRS=.*|ALLOWED_CIDRS=${SUBNET}|" /opt/vnc-gateway/.env
+    pct exec "$CTID" -- docker compose -f /opt/vnc-gateway/docker-compose.yml up -d >/dev/null 2>&1
+  else
+    warn "Could not determine the container's subnet; set ALLOWED_CIDRS in /opt/vnc-gateway/.env by hand."
+  fi
 else
   say "Skipping the vnc-gateway installer (RUN_INSTALLER=$RUN_INSTALLER)."
 fi
