@@ -58,6 +58,13 @@ TEMPLATE_STORE="${TEMPLATE_STORE:-$(pvesm status --content vztmpl | awk 'NR>1 &&
 say "rootfs storage:   $ROOT_STORE"
 say "template storage: $TEMPLATE_STORE"
 
+# guacd only has arm64 images from 1.6.0 onward; docker-compose.yml pins that.
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  x86_64|amd64|aarch64|arm64) say "host architecture: $HOST_ARCH" ;;
+  *) warn "host architecture is '$HOST_ARCH'; guacd publishes amd64 and arm64 only." ;;
+esac
+
 # --- ZFS / overlayfs check --------------------------------------------------
 # Docker's overlay2 driver could not run on ZFS-backed container rootfs until
 # ZFS 2.2 (shipped in Proxmox VE 8.1). On older ZFS you get pushed onto
@@ -262,8 +269,56 @@ pct create "$CTID" "$TEMPLATE_REF" \
   --description "vnc-gateway - browser VNC gateway (guacd + node)" \
   "${PCT_AUTH[@]}"
 
+# --- AppArmor ---------------------------------------------------------------
+# Proxmox's ARM builds commonly run a kernel without AppArmor compiled in. LXC
+# then fails applying a profile that cannot exist, and `pct start` dies with the
+# useless "sync_wait: 34 ... Failed to spawn container". Handle it up front
+# instead of leaving a created-but-unstartable container behind.
+#
+# On a kernel WITH AppArmor this setting would remove real protection. On one
+# without it there is nothing to remove -- we are only telling LXC to stop
+# trying. Hence the check rather than setting it unconditionally.
+APPARMOR_ENABLED_FILE="${APPARMOR_ENABLED_FILE:-/sys/module/apparmor/parameters/enabled}"
+PVE_CONF_DIR="${PVE_CONF_DIR:-/etc/pve/lxc}"
+CT_CONF="${PVE_CONF_DIR}/${CTID}.conf"
+
+set_unconfined() {
+  if grep -q '^lxc.apparmor.profile:' "$CT_CONF" 2>/dev/null; then
+    return 0
+  fi
+  # Never fatal: a container that starts fine without this should not be
+  # sunk by an unwritable config path.
+  if ! echo "lxc.apparmor.profile: unconfined" >> "$CT_CONF" 2>/dev/null; then
+    warn "could not write $CT_CONF -- if the start fails, add this line by hand:"
+    warn "    lxc.apparmor.profile: unconfined"
+  fi
+  return 0
+}
+
+APPARMOR_OK=0
+if [ -r "$APPARMOR_ENABLED_FILE" ] && grep -qi '^y' "$APPARMOR_ENABLED_FILE" 2>/dev/null; then
+  APPARMOR_OK=1
+fi
+
+if [ "$APPARMOR_OK" = "0" ]; then
+  warn "No usable AppArmor on this kernel (normal on Proxmox ARM builds)."
+  warn "Setting 'lxc.apparmor.profile: unconfined' so the container can start."
+  set_unconfined
+fi
+
 say "Starting..."
-pct start "$CTID"
+if ! pct start "$CTID" >/dev/null 2>&1; then
+  # Fallback for the case where AppArmor reports as enabled but the profile
+  # still cannot be applied.
+  warn "First start failed; retrying without an AppArmor profile..."
+  set_unconfined
+  if ! pct start "$CTID"; then
+    warn "Still failing. Get the real error with:"
+    warn "    lxc-start -n $CTID -F -l DEBUG -o /tmp/lxc-$CTID.log"
+    warn "Remove the container with: pct destroy $CTID"
+    die "container $CTID could not be started"
+  fi
+fi
 
 # --- Wait for the network ---------------------------------------------------
 say "Waiting for network inside the container..."
