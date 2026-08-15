@@ -101,7 +101,26 @@ running on the Windows box.
 
 ## Stage 2 — deploy to the Proxmox LXC
 
-On a fresh Debian LXC, as root:
+### If you have no container yet
+
+Run this on the **Proxmox host** as root. It creates an unprivileged LXC with
+the recommended specs (2 vCPU / 2 GB / 8 GB, `nesting=1,keyctl=1`, `onboot`),
+then installs vnc-gateway inside it:
+
+```bash
+CT_IP=192.168.1.20/24 CT_GW=192.168.1.1 bash proxmox/create-lxc.sh
+```
+
+It picks the newest Debian template and an appropriate storage automatically,
+refuses to run anywhere but a Proxmox host, and stops if the rootfs storage is
+ZFS older than 2.2 (where Docker's `overlay2` driver cannot run). Use
+`CT_SSHKEY=/root/.ssh/id_ed25519.pub` to inject a key instead of being prompted
+for a root password. Sizing rationale and the full list of overrides are in
+[docs/lxc-setup.md](docs/lxc-setup.md).
+
+### If the container already exists
+
+As root inside it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/install.sh | bash
