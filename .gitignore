@@ -1,3 +1,6 @@
-.env
-connections.json
+# Root only: test/e2e has its own throwaway connections.json that must be tracked.
+/.env
+/connections.json
+/recordings/
 node_modules/
+test/e2e/out/

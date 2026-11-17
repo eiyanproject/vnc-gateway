@@ -1,193 +1,189 @@
 # vnc-gateway
 
-Browser-based VNC gateway. `guacd` handles the RFB protocol; a small Node app
-owns authentication, target selection, and token minting; the frontend is
-`guacamole-common-js` with no build step.
+Remote desktop in a browser. `guacd` speaks VNC; a small Node app decides who
+may open which desktop and mints single-use sessions; the frontend is
+`guacamole-common-js` with no build step. Runs on amd64 and arm64.
 
-Runs on **amd64 and arm64**. `guacd` must be 1.6.0 or newer — the 1.5.x images
-are published for amd64 only, so on ARM the pull fails with `no matching
-manifest for linux/arm64`.
+```
+browser ──https──▶ Cloudflare edge ─Access─▶ tunnel ─▶ OCI box: cloudflared ─▶ Caddy
+                                                                                │ Tailscale
+LAN browser ──http──────────────────────────────────────────────────────────┐   ▼
+                                                                             ▼  LXC :8088
+                                                     ┌──────── app (Node) ──────────┐
+                                                     │ host guard · Access JWT       │
+                                                     │ sessions · allowlist · metrics│
+                                                     └───────────┬───────────────────┘
+                                                                 │ guacamole protocol
+                                                             guacd (no port published)
+                                                                 │ RFB
+                                                         Windows :5900 (TightVNC)
+```
 
-Built in stages. **Stage 1 is local-only and has no login** — that is deliberate,
-not an oversight. Get pixels on screen first, then add the perimeter.
+Public access follows the same path as `learnbox`, `l18.` and `cms.`: no open
+ports anywhere, Cloudflare Access in front, and the app verifying the Access
+token itself. See [docs/REMOTE-ACCESS.md](docs/REMOTE-ACCESS.md).
 
 ---
 
-## Stage 1 — make it work on your LAN
+## Security model
 
-### 1. A VNC server on the Windows box
+Every layer is independent; none relies on another being configured right.
 
-Install TightVNC Server. In its settings:
-
-- set a primary password (max 8 chars — that's a VNC protocol limit, not a bug)
-- note the port, default `5900`
-- allow it through Windows Firewall
-
-> Windows 11 Home Single Language has no RDP *host*, so VNC is the right call
-> here — the usual "just use RDP through Guacamole, it's faster" advice doesn't
-> apply to this machine.
-
-Once it works, tighten the Windows Firewall rule for port 5900 to accept only
-the gateway's IP. VNC's own auth is 8 characters of weak DES — treat it as a
-speed bump, not a control.
-
-### 2. Configure
-
-```bash
-cp .env.example .env
-cp connections.example.json connections.json
-```
-
-Generate the key (must be exactly 32 characters):
-
-```bash
-docker run --rm node:22-alpine node -e "console.log(require('crypto').randomBytes(24).toString('base64').slice(0,32))"
-```
-
-Put it in `.env` as `TOKEN_ENCRYPTION_KEY`, then edit `connections.json`:
-
-- **testing from the same machine as Docker**: leave `hostname` as
-  `host.docker.internal`
-- **running on the Proxmox LXC**: set `hostname` to the Windows box's LAN IP
-
-### 3. Run
-
-```bash
-docker compose up --build
-```
-
-Open <http://localhost:8088> and click the connection. You should get a desktop.
-
-(Port 8088 because `catalog-api-dev` already owns 8080 on this machine. Change
-`HOST_PORT` in `.env` if you want something else.)
-
----
-
-## What Stage 1 already does right
-
-The security model is in place even though the login isn't:
-
-- **The browser never sees a VNC password or the encryption key.** It sends a
-  connection *ID*; the server looks up the credential and mints the token. Most
-  guacamole-lite examples build the token client-side, which hands the client
-  both the key and free choice of target.
-- **Session handles are single-use and expire in 60s**, checked during the
-  WebSocket upgrade before guacamole-lite sees the request.
-- **`guacd` is not published.** It has no authentication whatsoever, so it stays
-  inside the compose network.
-- **Free-form IPs are allowlisted by CIDR and port**, and hostnames are refused
-  outright to close off DNS rebinding. Empty `ALLOWED_CIDRS` disables it.
-
-Every deferred piece is marked in the source with `[STAGE n: ...]`.
-
-### Verified
-
-The gates were exercised against the running stack:
-
-| Test | Result |
+| Layer | What it stops |
 |---|---|
-| WebSocket upgrade, no `sid` | 401 |
-| WebSocket upgrade, forged `sid` | 401 |
-| WebSocket upgrade, valid `sid` | accepted, guacd creates a VNC client |
-| Same `sid` replayed | 401 |
-| `POST /api/sessions` for `192.168.0.50:5900` | 200 (in `ALLOWED_CIDRS`) |
-| `POST /api/sessions` for `8.8.8.8` | 403, logged as DENIED |
-| `POST /api/sessions` for `192.168.9.50` | 403, adjacent subnet |
-| `POST /api/sessions` for `192.168.0.50:22` | 403, port not allowed |
-| `POST /api/sessions` for a hostname | 403, DNS-rebinding guard |
-| `GET /api/connections` | labels + IDs only, no hostname or password |
-| guacd port 4822 from the host | not reachable |
+| **Cloudflare Access** (edge) | Strangers never reach the origin. One-time PIN to your email. |
+| **Access JWT verified in the app** | If Access is deleted, misconfigured or bypassed, the public hostname answers 403. Signature, issuer and *this app's* audience are all checked. |
+| **Host guard** | Any hostname not listed answers 421. Stops DNS rebinding against a LAN service with no login, and a half-configured public name answers 503 rather than serving a desktop. |
+| **Server-side sessions** | The browser sends a connection *ID*. The server looks up the VNC password, encrypts the connection token, and keeps it: the browser only ever holds an opaque handle that works **once**, within 60 s, for the identity that minted it. |
+| **Origin + `X-VNCGW` header** | Cross-site POSTs and cross-site WebSocket hijacking are refused. |
+| **Free-form allowlist** | "Connect to an address" accepts IPv4 literals in `ALLOWED_CIDRS` on `ALLOWED_PORTS` only. Hostnames are refused, so DNS cannot be used to redirect it. |
+| **Rate limit** | Session minting is limited per user (or per LAN address), so it cannot be used to guess VNC passwords or sweep the allowlisted range. |
+| **Containers** | App runs as non-root on a read-only filesystem with no capabilities. `guacd` has no published port; it has no authentication of its own. |
+| **Headers** | Strict CSP, `frame-ancestors 'none'`, `X-Robots-Tag: noindex`, no referrer. |
 
-The only untested link is guacd → an actual VNC server, which needs TightVNC
-running on the Windows box.
+**On the LAN there is no login**, by design and the same as learnbox: anyone who
+can reach `<lxc-ip>:8088` can open the desktops in `connections.json`. Narrow
+the Windows firewall rule for TCP 5900 to the LXC's address so the VNC server
+itself is only reachable through the gateway, and never forward port 8088 on
+the router.
+
+VNC's own password is 8 characters of weak DES. It is a speed bump on the LAN,
+not a control; the layers above are the controls.
 
 ---
 
-## Stage 2 — deploy to the Proxmox LXC
+## Deploy
 
-### If you have no container yet
+### New container
 
-Run this on the **Proxmox host** as root. It creates an unprivileged LXC with
-the recommended specs (2 vCPU / 2 GB / 8 GB, `nesting=1,keyctl=1`, `onboot`),
-then installs vnc-gateway inside it:
+On the Proxmox host. It asks for the address, shows a plan, and asks before
+creating anything (2 vCPU / 2 GB / 8 GB, unprivileged, `nesting=1,keyctl=1`):
 
 ```bash
-bash proxmox/create-lxc.sh
+curl -fsSLO https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/proxmox/create-lxc.sh
+bash create-lxc.sh
 ```
 
-It picks the newest Debian template and an appropriate storage automatically,
-refuses to run anywhere but a Proxmox host, and stops if the rootfs storage is
-ZFS older than 2.2 (where Docker's `overlay2` driver cannot run). Use
-`CT_SSHKEY=/root/.ssh/id_ed25519.pub` to inject a key instead of being prompted
-for a root password. Sizing rationale and the full list of overrides are in
+### Update an existing container
+
+On the Proxmox node that hosts it. Plan only until `--yes`; `--snapshot` gives a
+rollback point:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/proxmox/update-lxc.sh
+bash update-lxc.sh --ctid <CTID>
+bash update-lxc.sh --ctid <CTID> --snapshot --yes
+```
+
+The update runs `install.sh` inside the container. It is idempotent: it keeps
+your `.env`, token key and `connections.json`, adds settings new versions
+introduce, retires obsolete ones as comments, and then **checks the gates on the
+running app** — an unknown hostname must get 421 and a public hostname without a
+token must get 403, or the update fails loudly.
+
+Sizing, storage backends and the LXC feature flags are in
 [docs/lxc-setup.md](docs/lxc-setup.md).
 
-### If the container already exists
+### The Windows side
 
-As root inside it:
+TightVNC Server: set a password, keep port 5900, then restrict the Windows
+Firewall rule for TCP 5900 to the gateway LXC's IP. Windows 11 Home has no RDP
+host, so VNC is the right protocol for this machine.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/install.sh | bash
+### Saved connections
+
+`/opt/vnc-gateway/connections.json`, readable only by the app:
+
+```json
+[
+  { "id": "desk", "label": "Windows desktop", "hostname": "192.168.0.213", "port": 5900, "password": "..." },
+  { "id": "lab",  "label": "Lab box", "hostname": "192.168.0.50", "password": "...",
+    "allowedUsers": ["you@example.com"] }
+]
 ```
 
-Then edit `/opt/vnc-gateway/connections.json` — set `hostname` to the Windows
-box's LAN IP — and restart:
+`allowedUsers` restricts who may use a connection **through Cloudflare Access**.
+LAN users are trusted and see everything. Restart after editing:
+`docker compose -f /opt/vnc-gateway/docker-compose.yml restart app`.
+
+---
+
+## Configuration (`.env`)
+
+| Key | Default | |
+|---|---|---|
+| `TOKEN_ENCRYPTION_KEY` | generated | 32 characters. Encrypts connection tokens. |
+| `HOST_PORT` | `8088` | Port on the LXC. |
+| `ALLOWED_HOSTS` | container name | LAN hostnames besides IPs and `localhost`. |
+| `ACCESS_HOSTS` / `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD` | empty | Public hostname behind Cloudflare Access. All three or none. Set via `update-lxc.sh --access-*`. |
+| `ALLOWED_CIDRS` | the LXC's subnet | Free-form targets. Empty disables the feature. |
+| `ALLOWED_PORTS` | `5900,5901` | Free-form target ports. |
+| `SESSION_TTL_SECONDS` | `60` | Life of an unused session handle. |
+| `SESSIONS_PER_MINUTE` | `20` | Per user (Access) or per address (LAN). |
+| `RECORDING` | `0` | `1` records every session into `recordings/`. |
+| `LOG_LEVEL` | `info` | |
+| `LOG_DRIVER` | `journald` if present | Docker log driver; otherwise `local`, which rotates. |
+
+---
+
+## Operations
+
+**Logs** — one JSON object per line (`ts`, `level`, `msg`, `svc`) via journald
+to VictoriaLogs. They double as the audit trail: `session minted`, `session
+opened`, `session denied`, `request refused` and `websocket refused` carry the
+user, the target and the reason. Passwords and tokens are never logged.
 
 ```bash
-docker compose -f /opt/vnc-gateway/docker-compose.yml restart app
+docker compose -f /opt/vnc-gateway/docker-compose.yml logs -f app
 ```
 
-### Updating
+**Health and metrics** — the homelab service contract:
 
-Re-run the same script. That *is* the update path:
+| | |
+|---|---|
+| `GET /healthz` | liveness, version |
+| `GET /readyz` | 503 unless guacd is reachable and any public hostname is fully configured |
+| `GET /metrics` | `vncgw_build_info`, `vncgw_requests_total{route,method,status}`, `vncgw_request_duration_seconds{route}`, `vncgw_errors_total{kind}`, plus `vncgw_active_sessions` and `vncgw_sessions_total{kind}` |
+
+Register it with the monitoring stack once per node (homelab-monitoring):
 
 ```bash
-bash /opt/vnc-gateway/install.sh
+./scripts/register-service.sh --ctid <mon CTID> --service vnc-gateway --target <lxc-ip>:8088 --yes
 ```
 
-It is idempotent. It pulls the latest source, rebuilds, and:
+`errors_total{kind}` kinds: `host_rejected`, `access_no_token`, `access_denied`,
+`access_unconfigured`, `access_keys_unavailable`, `csrf_rejected`,
+`origin_rejected`, `sid_rejected`, `rate_limited`, `connection_denied`,
+`allowlist_denied`, `guacd`, `not_ready`, `internal`.
 
-- **keeps** your `.env`, your generated `TOKEN_ENCRYPTION_KEY`, and your
-  `connections.json`
-- **adds** any new setting that has appeared in `.env.example` since you
-  installed, so new options arrive without clobbering your values
-- checks the Proxmox `nesting=1,keyctl=1` flags up front, because without them
-  Docker installs cleanly and then fails at the first `docker run` — which is a
-  confusing way to find out
+**Recordings** — with `RECORDING=1`, guacd writes one file per session into
+`/opt/vnc-gateway/recordings/` (Guacamole protocol dumps; convert to video with
+`guacenc` from the guacamole-server package). They contain everything that was
+on screen. Nothing deletes them automatically.
 
-Overrides: `VNCGW_DIR` (default `/opt/vnc-gateway`), `VNCGW_REPO`, `VNCGW_REF`.
+---
 
-Manual setup, and the detail on the LXC feature flags, is in
-[docs/lxc-setup.md](docs/lxc-setup.md).
+## Tests
 
-## Stage 3 — Cloudflare Tunnel + Access
+| | |
+|---|---|
+| `bash test/run-unit.sh` | 42 unit + integration tests: allowlist, sessions, Access JWT (valid, wrong audience/issuer, expired, unknown key, foreign key, `alg:none`), host guard, CSRF, WebSocket gates, rate limiting, logs. Boots the real server. |
+| `bash test/e2e/run.sh` | Real Chromium → app → guacd → a real VNC server, on the production compose file: pixels, fit-to-window scaling, mouse mapping, keyboard, clipboard both ways, recording, metrics, CSP. |
+| `bash test/run-scripts.sh` | `create-lxc.sh`, `update-lxc.sh`, `setup-oci.sh` and `install.sh` against stubbed Proxmox / OCI hosts, plus shellcheck. |
 
-Deferred until the domain exists. When you get there:
+All need only Docker.
 
-1. Create a tunnel, add `cloudflared` to `docker-compose.yml`, point the ingress
-   rule at `http://app:8080`.
-2. Change the app's port mapping to `127.0.0.1:8080:8080` so only the tunnel can
-   reach it.
-3. Create an Access application for the hostname. Copy its **Application
-   Audience (AUD) tag**.
-4. Set `AUTH_MODE=cloudflare`, `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` in `.env`.
-5. **Verify the gate is real**: with the tunnel up, `curl` the LXC's IP:8080
-   directly. It must return 401, not the app. If it returns the app, the JWT
-   check isn't running.
+---
 
-Two things that bite here:
-- WebSockets through the tunnel work, but add an app-level keepalive so idle
-  sessions aren't reaped by an intermediate timeout.
-- Use a **wildcard certificate** if you ever terminate TLS yourself. Every
-  publicly-trusted cert is published to Certificate Transparency logs, and
-  subdomain-enumeration services scrape them continuously — a cert for
-  `vnc.yourdomain.com` makes that hostname public knowledge within minutes.
-  Behind a Cloudflare tunnel your origin has no public cert at all, which sides
-  steps this entirely.
+## Layout
 
-## Stage 4 — hardening
-
-- Per-user authorisation on connections (`src/index.js`, marked)
-- Postgres for connections + an audit log (currently a JSON file + stdout)
-- Rate-limit `/api/sessions`
-- Session recording via guacd's `recording-path`
+```
+src/            server: index (wiring), guard (host + Access), access (JWT),
+                sessions, allowlist, ratelimit, metrics, log, config
+public/         the page; guacamole-common-js is wrapped into vendor/ at build
+proxmox/        create-lxc.sh, update-lxc.sh   (run on the Proxmox host)
+oci/            setup-oci.sh                   (run on the OCI tunnel host)
+install.sh      runs inside the container; install and update
+docs/           REMOTE-ACCESS.md, lxc-setup.md, HANDOVER.md
+test/           unit/, integration/, e2e/, scripts/
+```

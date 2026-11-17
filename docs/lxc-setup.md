@@ -1,18 +1,23 @@
-# Stage 2 — Docker in a Proxmox LXC
+# Docker in a Proxmox LXC
 
-Running Docker inside an unprivileged LXC works fine on Proxmox 8, but it needs
-two features enabled that are off by default. Without them Docker installs
+Running Docker inside an unprivileged LXC works fine on Proxmox 8 and 9, but it
+needs two features enabled that are off by default. Without them Docker installs
 cleanly and then fails at the first `docker run`, which makes the cause hard to
 spot.
 
 ## The scripted path
 
-On the **Proxmox host**, as root — this creates the container with the
-recommended specs, enables the feature flags, and installs vnc-gateway inside:
+On the **Proxmox host**, as root — this asks for the address, shows a plan, and
+on confirmation creates the container with the recommended specs, enables the
+feature flags, and installs vnc-gateway inside:
 
 ```bash
-bash proxmox/create-lxc.sh
+bash proxmox/create-lxc.sh            # interactive
+CT_IP=192.168.0.30/24 CT_GW=192.168.0.1 bash proxmox/create-lxc.sh --yes   # unattended
 ```
+
+Updates afterwards go through `proxmox/update-lxc.sh --ctid <CTID>` (plan only
+until `--yes`).
 
 Everything below is what that script does, for when you'd rather do it by hand
 or need to understand a failure.

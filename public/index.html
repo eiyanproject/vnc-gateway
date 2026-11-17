@@ -4,16 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
   <title>VNC Gateway</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header id="bar">
-    <strong>VNC Gateway</strong>
+    <strong class="brand">VNC Gateway</strong>
     <span id="status" class="status">idle</span>
+    <span id="target" class="who"></span>
     <span class="spacer"></span>
-    <button id="cad" hidden>Ctrl-Alt-Del</button>
-    <button id="disconnect" hidden>Disconnect</button>
+    <span id="session-tools" hidden>
+      <button id="scale" type="button" title="Toggle between fit-to-window and 1:1 pixels">Fit</button>
+      <button id="clip" type="button" title="Clipboard">Clipboard</button>
+      <button id="fullscreen" type="button">Fullscreen</button>
+      <button id="cad" type="button" title="Send Ctrl-Alt-Del">Ctrl-Alt-Del</button>
+      <button id="disconnect" type="button">Disconnect</button>
+    </span>
     <span id="whoami" class="who"></span>
   </header>
 
@@ -23,19 +30,33 @@
 
     <section id="freeform" hidden>
       <h2>Connect to an address</h2>
-      <p class="hint">Restricted to the CIDRs and ports set in <code>ALLOWED_CIDRS</code>.</p>
+      <p class="hint">Limited to the networks and ports in <code>ALLOWED_CIDRS</code> / <code>ALLOWED_PORTS</code>.</p>
       <form id="adhoc">
-        <input id="host" placeholder="192.168.1.50" autocomplete="off" required>
-        <input id="port" placeholder="5900" value="5900" size="6" autocomplete="off">
+        <input id="host" placeholder="192.168.0.50" autocomplete="off" required inputmode="decimal">
+        <input id="port" placeholder="5900" value="5900" size="6" autocomplete="off" inputmode="numeric">
         <input id="password" type="password" placeholder="VNC password" autocomplete="off">
         <button type="submit">Connect</button>
       </form>
     </section>
 
-    <p id="error" class="error" hidden></p>
+    <p id="recording-note" class="hint" hidden>Sessions on this gateway are recorded.</p>
+    <p id="error" class="error" role="alert" hidden></p>
   </main>
 
-  <div id="display"></div>
+  <aside id="clip-panel" hidden>
+    <label for="clip-text">Clipboard</label>
+    <textarea id="clip-text" rows="5" placeholder="Text copied on the remote machine appears here. Type or paste here and press Send to put it on the remote clipboard."></textarea>
+    <div class="row">
+      <button id="clip-send" type="button">Send to remote</button>
+      <span id="clip-state" class="hint"></span>
+    </div>
+  </aside>
+
+  <!-- tabindex makes this focusable: the keyboard is bound here, not to the
+       document, so typing in the clipboard box never reaches the remote. -->
+  <div id="viewport" tabindex="0" hidden>
+    <div id="display"></div>
+  </div>
 
   <script src="vendor/guacamole-common.js"></script>
   <script src="app.js"></script>

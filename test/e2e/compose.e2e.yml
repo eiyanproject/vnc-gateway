@@ -1,0 +1,46 @@
+# Overlay on the real docker-compose.yml, so the end-to-end test exercises the
+# production container settings (read-only root, no capabilities, non-root
+# user) rather than a lookalike. Run it with test/e2e/run.sh.
+services:
+  guacd:
+    container_name: vncgw-e2e-guacd
+    volumes: !override
+      - e2e-recordings:/recordings
+
+  app:
+    container_name: vncgw-e2e-app
+    env_file: !override
+      - test/e2e/e2e.env
+    ports: !reset []
+    volumes: !override
+      - ./test/e2e/connections.json:/app/connections.json:ro
+
+  vnc:
+    build: test/e2e/vnc
+    container_name: vncgw-e2e-vnc
+    networks: [vncgw]
+    volumes:
+      - e2e-shared:/shared
+      - e2e-recordings:/recordings
+
+  browser:
+    image: mcr.microsoft.com/playwright:v1.64.1-noble
+    container_name: vncgw-e2e-browser
+    profiles: [run]
+    networks: [vncgw]
+    environment:
+      BASE_URL: http://vncgw-e2e-app:8080   # not "app": .app is an HSTS-preloaded TLD, Chromium forces https
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    volumes:
+      - ./test/e2e/browser:/e2e-src:ro
+      - ./test/e2e/out:/out
+      - e2e-shared:/shared
+      - e2e-recordings:/recordings:ro
+    command:
+      - bash
+      - -c
+      - mkdir -p /e2e && cp -r /e2e-src/. /e2e && cd /e2e && npm install --no-audit --no-fund --silent && node test.mjs
+
+volumes:
+  e2e-shared:
+  e2e-recordings:

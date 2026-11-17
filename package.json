@@ -1,16 +1,21 @@
 {
   "name": "vnc-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "commonjs",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\""
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "guacamole-lite": "^1.2.0",
-    "guacamole-common-js": "^1.5.0",
-    "jose": "^5.9.6"
+    "@prometheus-io/client": "^0.16.1",
+    "express": "^4.22.3",
+    "guacamole-common-js": "1.5.0",
+    "guacamole-lite": "1.2.0",
+    "jose": "^5.10.0"
   }
 }

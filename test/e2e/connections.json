@@ -1,0 +1,9 @@
+[
+  {
+    "id": "e2e",
+    "label": "E2E desktop",
+    "hostname": "vnc",
+    "port": 5900,
+    "password": "e2e-pass"
+  }
+]

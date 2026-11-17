@@ -1,23 +1,39 @@
 * { box-sizing: border-box; }
 
+html, body { height: 100%; }
+
 body {
   margin: 0;
   background: #14161a;
   color: #e6e8ea;
   font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow: hidden;
 }
 
 #bar {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 10;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   height: 40px;
-  padding: 0 14px;
+  padding: 0 12px;
   background: #1c1f25;
   border-bottom: 1px solid #2b2f37;
+  white-space: nowrap;
 }
 
+.brand { font-weight: 600; }
+
+/* Narrow windows and phones: the session buttons matter more than labels. */
+@media (max-width: 760px) {
+  #bar { overflow-x: auto; }
+  #target, #whoami, .brand { display: none; }
+}
 .spacer { flex: 1; }
+#session-tools { display: inline-flex; gap: 6px; }
+#session-tools[hidden] { display: none; }
 
 .status {
   font-size: 12px;
@@ -29,11 +45,11 @@ body {
 .status.good { background: #17351f; color: #6ee79b; }
 .status.bad  { background: #3a1b1b; color: #ff8e8e; }
 
-.who { font-size: 12px; color: #7c848f; }
+.who { font-size: 12px; color: #7c848f; overflow: hidden; text-overflow: ellipsis; }
 
 button {
   font: inherit;
-  padding: 6px 12px;
+  padding: 5px 11px;
   border: 1px solid #3a4049;
   border-radius: 6px;
   background: #262b33;
@@ -41,8 +57,15 @@ button {
   cursor: pointer;
 }
 button:hover { background: #2f3540; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid #5b8def; outline-offset: 1px; }
 
-main { padding: 24px; max-width: 640px; }
+main {
+  position: absolute;
+  inset: 40px 0 0 0;
+  overflow: auto;
+  padding: 24px 16px;
+}
+main > * { max-width: 640px; }
 
 h2 { font-size: 15px; font-weight: 600; margin: 24px 0 10px; }
 h2:first-child { margin-top: 0; }
@@ -51,14 +74,17 @@ h2:first-child { margin-top: 0; }
 #connections button { width: 100%; text-align: left; padding: 12px 14px; }
 
 form { display: flex; gap: 8px; flex-wrap: wrap; }
-input {
+input, textarea {
   font: inherit;
   padding: 7px 10px;
   border: 1px solid #3a4049;
   border-radius: 6px;
   background: #1b1f25;
   color: #e6e8ea;
+  min-width: 0;
 }
+#host { flex: 1 1 160px; }
+#password { flex: 1 1 140px; }
 
 .hint { font-size: 12px; color: #7c848f; }
 .error {
@@ -70,5 +96,36 @@ input {
   font-size: 13px;
 }
 
+#viewport {
+  position: absolute;
+  inset: 40px 0 0 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #000;
+  outline: none;
+}
+#viewport[hidden] { display: none; }
+#viewport.one-to-one { display: block; overflow: auto; }
 #display { line-height: 0; }
 #display canvas { display: block; }
+
+#clip-panel {
+  position: fixed;
+  top: 48px;
+  right: 12px;
+  z-index: 20;
+  width: min(420px, calc(100vw - 24px));
+  padding: 12px;
+  background: #1c1f25;
+  border: 1px solid #2b2f37;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  display: grid;
+  gap: 8px;
+}
+#clip-panel[hidden] { display: none; }
+#clip-panel label { font-weight: 600; }
+#clip-panel textarea { width: 100%; resize: vertical; }
+#clip-panel .row { display: flex; align-items: center; gap: 10px; }

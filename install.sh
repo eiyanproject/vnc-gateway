@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 #
-# vnc-gateway installer / updater.
+# vnc-gateway installer / updater. Runs INSIDE the container (or any Debian
+# host with Docker). From the Proxmox host, use proxmox/update-lxc.sh, which
+# calls this.
 #
 # Re-running this script IS the update path. It is idempotent: it never
-# overwrites your .env or connections.json, it only fills in things that are
-# missing. Safe to run as often as you like.
+# overwrites your .env or connections.json, it only fills in what is missing.
 #
 #   Install:  bash install.sh
-#   Update:   bash install.sh      (same command, from anywhere)
+#   Update:   bash /opt/vnc-gateway/install.sh
+#
+# Cloudflare Access for a public hostname: pass all three, or none. They are
+# written into .env; proxmox/update-lxc.sh passes them for one exec only.
+#   ACCESS_HOSTS=vnc-xyz.example.com ACCESS_TEAM_DOMAIN=team.cloudflareaccess.com \
+#   ACCESS_AUD=<64 hex> bash install.sh
 #
 # Environment overrides:
 #   VNCGW_DIR   install location   (default /opt/vnc-gateway)
@@ -20,36 +26,45 @@ VNCGW_DIR="${VNCGW_DIR:-/opt/vnc-gateway}"
 VNCGW_REPO="${VNCGW_REPO:-https://github.com/eiyanproject/vnc-gateway.git}"
 VNCGW_REF="${VNCGW_REF:-main}"
 
+# Captured before anything reads .env, so they are unambiguously "from the caller".
+IN_ACCESS_HOSTS="${ACCESS_HOSTS:-}"
+IN_ACCESS_TEAM="${ACCESS_TEAM_DOMAIN:-}"
+IN_ACCESS_AUD="${ACCESS_AUD:-}"
+
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m fail\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (or under sudo): sudo bash install.sh"
 
+# --- 0. Validate Access input before touching anything ----------------------
+if [ -n "$IN_ACCESS_HOSTS$IN_ACCESS_TEAM$IN_ACCESS_AUD" ]; then
+  [ -n "$IN_ACCESS_HOSTS" ] && [ -n "$IN_ACCESS_TEAM" ] && [ -n "$IN_ACCESS_AUD" ] ||
+    die "ACCESS_HOSTS, ACCESS_TEAM_DOMAIN and ACCESS_AUD go together: a public hostname without the other two fails closed"
+  IN_ACCESS_HOSTS="$(printf '%s' "$IN_ACCESS_HOSTS" | tr 'A-Z' 'a-z')"
+  IN_ACCESS_TEAM="$(printf '%s' "$IN_ACCESS_TEAM" | tr 'A-Z' 'a-z' | sed -e 's#^https\?://##' -e 's#/*$##')"
+  printf '%s' "$IN_ACCESS_HOSTS" | grep -Eq '^[a-z0-9.-]+\.[a-z]{2,}(,[a-z0-9.-]+\.[a-z]{2,})*$' ||
+    die "ACCESS_HOSTS does not look like a hostname: $IN_ACCESS_HOSTS"
+  printf '%s' "$IN_ACCESS_TEAM" | grep -Eq '^[a-z0-9-]+\.cloudflareaccess\.com$' ||
+    die "ACCESS_TEAM_DOMAIN should look like <team>.cloudflareaccess.com, got: $IN_ACCESS_TEAM"
+  printf '%s' "$IN_ACCESS_AUD" | grep -Eq '^[0-9a-f]{64}$' ||
+    die "ACCESS_AUD should be the 64-character hex Application Audience tag"
+fi
+
 # --- 1. LXC sanity check ----------------------------------------------------
 # Docker inside an unprivileged Proxmox LXC needs nesting=1 and keyctl=1. Without
-# them Docker installs cleanly and then fails at the first `docker run`, which
-# makes the real cause hard to spot -- so check up front rather than later.
-if grep -qa 'container=lxc' /proc/1/environ 2>/dev/null || [ -f /run/.containerenv ]; then
+# them Docker installs cleanly and then fails at the first `docker run`.
+if grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then
   say "Proxmox LXC detected."
-  if ! grep -qs 'nesting' /proc/self/mountinfo 2>/dev/null && [ ! -d /sys/fs/cgroup/system.slice ]; then
-    warn "Could not confirm nesting is enabled."
-    warn "If Docker fails below, set this on the PROXMOX HOST in /etc/pve/lxc/<CTID>.conf:"
-    warn "    features: nesting=1,keyctl=1"
-    warn "then restart the container. Do NOT reach for apparmor:unconfined instead."
-  fi
 fi
 
 # --- 2. Dependencies --------------------------------------------------------
-# Only probe things that are actually binaries. ca-certificates is a package,
-# not a command, so testing it with `command -v` always fails and would drag in
-# a full apt-get update on every single run.
-need_apt_update=0
+# Only probe real binaries: ca-certificates is a package, not a command.
+need_apt=0
 for bin in git curl; do
-  command -v "$bin" >/dev/null 2>&1 || need_apt_update=1
+  command -v "$bin" >/dev/null 2>&1 || need_apt=1
 done
-
-if [ "$need_apt_update" -eq 1 ]; then
+if [ "$need_apt" -eq 1 ]; then
   say "Installing base packages..."
   apt-get update -qq
   apt-get install -y -qq git curl ca-certificates
@@ -69,15 +84,15 @@ else
   say "Docker already present: $(docker --version)"
 fi
 
-docker info >/dev/null 2>&1 || die "Docker is installed but not working. In an LXC this is almost always the missing nesting=1,keyctl=1 features flags -- see the warning above."
+docker info >/dev/null 2>&1 || die "Docker is installed but not working. In an LXC this is almost always missing features: on the Proxmox host, pct set <CTID> --features nesting=1,keyctl=1 && pct reboot <CTID>"
 
 # --- 3. Fetch or update the source -----------------------------------------
 if [ -d "$VNCGW_DIR/.git" ]; then
   say "Updating existing install at $VNCGW_DIR ..."
   git -C "$VNCGW_DIR" fetch --quiet origin "$VNCGW_REF"
   git -C "$VNCGW_DIR" checkout --quiet "$VNCGW_REF"
-  # Hard reset is safe here: .env and connections.json are gitignored, so the
-  # only things discarded are local edits to tracked source files.
+  # Safe: .env, connections.json and recordings/ are gitignored, so the only
+  # things discarded are local edits to tracked source files.
   git -C "$VNCGW_DIR" reset --hard --quiet "origin/$VNCGW_REF"
 else
   say "Cloning into $VNCGW_DIR ..."
@@ -86,8 +101,25 @@ else
 fi
 
 cd "$VNCGW_DIR"
+COMMIT="$(git rev-parse --short HEAD)"
 
 # --- 4. Config: create if missing, top up if incomplete ---------------------
+get_kv() { grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+
+# Replace (or append) KEY=VALUE without sed, so no value can collide with a
+# sed delimiter. Values reaching here are validated or generated.
+set_kv() {
+  local tmp
+  tmp="$(mktemp)"
+  awk -v k="$1" -v v="$2" '
+    index($0, k "=") == 1 { if (!done) { print k "=" v; done = 1 }; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' .env > "$tmp"
+  cat "$tmp" > .env
+  rm -f "$tmp"
+}
+
 if [ ! -f .env ]; then
   say "Creating .env ..."
   cp .env.example .env
@@ -95,38 +127,69 @@ else
   say "Keeping existing .env."
 fi
 
-# An update may introduce new settings. Append any key present in .env.example
-# but missing from .env, so a re-run picks up new options without clobbering
-# values you have already set.
+# Settings from before Access became per-hostname. Commented out rather than
+# deleted, so nothing you wrote disappears silently.
+for old in AUTH_MODE CF_ACCESS_TEAM_DOMAIN CF_ACCESS_AUD; do
+  if grep -q "^${old}=" .env; then
+    sed -i "s|^${old}=|# obsolete since 0.2 (see ACCESS_*): ${old}=|" .env
+    say "Retired obsolete setting $old."
+  fi
+done
+
+# New settings arrive with updates: append any key in .env.example that .env
+# lacks, without touching values already set.
 added=""
 while IFS= read -r line; do
   case "$line" in
     [A-Z_]*=*)
       key="${line%%=*}"
-      grep -q "^${key}=" .env || { printf '%s\n' "$line" >> .env; added="$added $key"; }
+      if ! grep -q "^${key}=" .env; then
+        printf '%s\n' "$line" >> .env
+        added="$added $key"
+      fi
       ;;
   esac
 done < .env.example
-# Written as a full `if` rather than `[ -n "$added" ] && say ...`, because under
-# `set -e` a trailing && list whose test fails takes the whole script down.
+# A full `if`: under `set -e` a trailing && list whose test fails ends the script.
 if [ -n "$added" ]; then
   say "Added new settings to .env:$added"
 fi
 
-# The token key must be exactly 32 bytes. Restrict to alphanumerics so the value
-# never needs quoting in .env or escaping in sed.
+# The token key must be exactly 32 bytes; alphanumerics only, so it never needs
+# quoting. Not `tr < /dev/urandom | head`: head exits first, tr dies of SIGPIPE,
+# and pipefail turns that into an intermittent silent exit.
 if grep -q '^TOKEN_ENCRYPTION_KEY=CHANGE_ME' .env || ! grep -q '^TOKEN_ENCRYPTION_KEY=.\{32\}$' .env; then
   say "Generating TOKEN_ENCRYPTION_KEY ..."
-  # Deliberately NOT `tr -dc ... < /dev/urandom | head -c 32`. /dev/urandom never
-  # ends, so head exits first, tr dies of SIGPIPE, and `set -o pipefail` turns
-  # that into a silent early exit -- intermittently, depending on who wins the
-  # race. Read a bounded chunk and slice it in the shell instead.
   raw="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
   newkey="${raw:0:32}"
   [ "${#newkey}" -eq 32 ] || die "could not generate a 32-character key (got ${#newkey})"
-  sed -i "s|^TOKEN_ENCRYPTION_KEY=.*|TOKEN_ENCRYPTION_KEY=${newkey}|" .env
+  set_kv TOKEN_ENCRYPTION_KEY "$newkey"
 else
   say "Keeping existing TOKEN_ENCRYPTION_KEY."
+fi
+
+# The container's own name, so http://<hostname>:8088 works on the LAN. Any
+# name not listed is refused (DNS rebinding defence).
+if [ -z "$(get_kv ALLOWED_HOSTS)" ]; then
+  hn="$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+  if [ -n "$hn" ]; then
+    set_kv ALLOWED_HOSTS "$hn"
+    say "ALLOWED_HOSTS set to this container's name: $hn"
+  fi
+fi
+
+if [ -n "$IN_ACCESS_HOSTS" ]; then
+  set_kv ACCESS_HOSTS "$IN_ACCESS_HOSTS"
+  set_kv ACCESS_TEAM_DOMAIN "$IN_ACCESS_TEAM"
+  set_kv ACCESS_AUD "$IN_ACCESS_AUD"
+  say "Cloudflare Access configured for $IN_ACCESS_HOSTS"
+fi
+
+# journald when it runs here, so container logs reach VictoriaLogs through the
+# guest's rsyslog. Docker's journald driver fails to start containers without it.
+if [ -z "$(get_kv LOG_DRIVER)" ] && systemctl is-active --quiet systemd-journald 2>/dev/null; then
+  set_kv LOG_DRIVER journald
+  say "Container logs go to journald."
 fi
 
 # Must exist before compose runs: it is bind-mounted, and Docker would otherwise
@@ -138,41 +201,75 @@ else
   say "Keeping existing connections.json."
 fi
 
+# Secrets: .env holds the token key, connections.json holds VNC passwords. The
+# app runs as uid 1000 in its container and must still read connections.json;
+# guacd (also uid 1000) writes recordings.
+chmod 600 .env
+chown 1000:1000 connections.json && chmod 600 connections.json
+mkdir -p recordings && chown 1000:1000 recordings && chmod 700 recordings
+
 # --- 5. Build and start -----------------------------------------------------
-say "Building and starting..."
-docker compose up -d --build
+say "Building and starting $COMMIT ..."
+VNCGW_COMMIT="$COMMIT" docker compose up -d --build --remove-orphans
 
-HOST_PORT="$(grep -E '^HOST_PORT=' .env | cut -d= -f2 || true)"
+HOST_PORT="$(get_kv HOST_PORT)"
 HOST_PORT="${HOST_PORT:-8088}"
+BASE="http://127.0.0.1:${HOST_PORT}"
 
-say "Waiting for the app to come up..."
-for i in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/health" >/dev/null 2>&1; then
-    ok=1; break
-  fi
+say "Waiting for the app..."
+ok=0
+for _ in $(seq 1 45); do
+  if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then ok=1; break; fi
   sleep 1
 done
+[ "$ok" = "1" ] || die "app did not answer /healthz within 45s. Check: docker compose -f $VNCGW_DIR/docker-compose.yml logs app"
 
-echo
-if [ "${ok:-0}" = "1" ]; then
-  say "Up and healthy."
+ready="$(curl -s "$BASE/readyz" || true)"
+case "$ready" in
+  *'"ready"'*) say "Ready: $ready" ;;
+  *) warn "Not ready yet: $ready" ;;
+esac
+
+# --- 6. Prove the gates, rather than assume them -----------------------------
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rebind-check.invalid' "$BASE/healthz" || true)"
+if [ "$code" = "421" ]; then
+  say "Host guard: unknown hostnames refused (421)."
 else
-  warn "App did not answer /api/health within 30s. Check: docker compose -f $VNCGW_DIR/docker-compose.yml logs"
+  die "Host guard NOT working: an unknown Host header got $code, expected 421"
+fi
+
+ACCESS_HOSTS_NOW="$(get_kv ACCESS_HOSTS)"
+if [ -n "$ACCESS_HOSTS_NOW" ]; then
+  first="${ACCESS_HOSTS_NOW%%,*}"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $first" "$BASE/healthz" || true)"
+  case "$code" in
+    403) say "Access gate: $first without a token is refused (403)." ;;
+    503) warn "Access gate: $first answers 503 -- ACCESS_TEAM_DOMAIN/ACCESS_AUD missing. Failing closed, which is safe, but it will not work until set." ;;
+    *)   die "ACCESS GATE NOT ENFORCED: $first without a token got $code. Do not publish this hostname until fixed." ;;
+  esac
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 cat <<EOF
 
   URL          http://${IP:-<this-host>}:${HOST_PORT}
+  Version      $(curl -s "$BASE/healthz" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p') ($COMMIT)
   Directory    $VNCGW_DIR
-  Logs         docker compose -f $VNCGW_DIR/docker-compose.yml logs -f
-  Update       bash $VNCGW_DIR/install.sh
+  Logs         docker compose -f $VNCGW_DIR/docker-compose.yml logs -f app
+  Update       bash $VNCGW_DIR/install.sh   (or proxmox/update-lxc.sh from the host)
 
-  Next:
-    1. Edit $VNCGW_DIR/connections.json -- set hostname to your Windows box's LAN IP.
-    2. Restart:  docker compose -f $VNCGW_DIR/docker-compose.yml restart app
+  Saved connections live in $VNCGW_DIR/connections.json. After editing:
+    docker compose -f $VNCGW_DIR/docker-compose.yml restart app
 
-  NOTE: AUTH_MODE=local means there is NO LOGIN. This is Stage 1 -- keep it on a
-  trusted LAN until Stage 3 (Cloudflare Access) is configured. See README.md.
+  Metrics      http://${IP:-<this-host>}:${HOST_PORT}/metrics  -- register with the
+               monitoring stack, once per node (homelab-monitoring):
+                 ./scripts/register-service.sh --ctid <mon CTID> --service vnc-gateway --target ${IP:-<ip>}:${HOST_PORT} --yes
 
 EOF
+if [ -z "$ACCESS_HOSTS_NOW" ]; then
+  cat <<EOF
+  No public hostname is configured: LAN only. To publish one behind Cloudflare
+  Access, follow docs/REMOTE-ACCESS.md.
+
+EOF
+fi

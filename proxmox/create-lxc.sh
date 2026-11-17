@@ -5,12 +5,14 @@
 #
 # RUN THIS ON THE PROXMOX HOST, as root -- not inside a container.
 #
-#   Just run it. It asks for what it needs:
+#   Just run it. It asks for what it needs, shows the plan, and asks before
+#   creating anything:
 #     bash create-lxc.sh
 #
-#   Or skip the questions (for automation):
-#     CT_IP=192.168.0.30/24 CT_GW=192.168.0.1 bash create-lxc.sh
-#     CT_IP=dhcp bash create-lxc.sh
+#   Or skip the questions (for automation). Without a terminal and without
+#   --yes it prints the plan and stops, like every host script here:
+#     CT_IP=192.168.0.30/24 CT_GW=192.168.0.1 bash create-lxc.sh --yes
+#     CT_IP=dhcp bash create-lxc.sh --yes
 #
 # Overrides (all optional; anything unset is prompted for or defaulted):
 #   CTID           container ID            (default: next free)
@@ -42,6 +44,15 @@ INSTALLER_URL="https://raw.githubusercontent.com/eiyanproject/vnc-gateway/main/i
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m fail\033[0m %s\n' "$*" >&2; exit 1; }
+
+CONFIRM="no"
+for arg in "$@"; do
+  case "$arg" in
+    --yes) CONFIRM="yes" ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    *) die "unknown argument: $arg (settings are environment variables; see --help)" ;;
+  esac
+done
 
 [ "$(id -u)" -eq 0 ] || die "run as root on the Proxmox host"
 command -v pct    >/dev/null 2>&1 || die "pct not found -- run this on the Proxmox HOST, not inside a container"
@@ -214,7 +225,7 @@ if [ -z "$CT_IP" ] && [ -t 0 ]; then
     *)
       while :; do
         printf '  IP address for the container (e.g. 192.168.0.30): '
-        read -r ans || ans=""
+        read -r ans || die "no input (end of file) - aborted"
         # Accept either a bare IP or one with a prefix already attached.
         case "$ans" in
           */*) ipaddr="${ans%%/*}"; prefix="${ans##*/}" ;;
@@ -245,7 +256,7 @@ if [ -z "$CT_IP" ] && [ -t 0 ]; then
 
       while :; do
         printf '  Gateway [%s]: ' "${HOST_GW:-192.168.0.1}"
-        read -r gw || gw=""
+        read -r gw || die "no input (end of file) - aborted"
         gw="${gw:-${HOST_GW:-192.168.0.1}}"
         if valid_ipv4 "$gw"; then
           break
@@ -291,6 +302,34 @@ if [ -n "$CT_SSHKEY" ]; then
 else
   warn "No CT_SSHKEY given; pct will prompt you for a root password."
   PCT_AUTH=(--password)
+fi
+
+# --- Plan -------------------------------------------------------------------
+cat <<PLAN
+
+  Plan
+  ----
+  container     $CTID  ($CT_HOSTNAME), unprivileged, nesting=1,keyctl=1, start on boot
+  template      $TEMPLATE_REF
+  specs         ${CT_CORES} vCPU / ${CT_RAM} MB RAM / ${CT_SWAP} MB swap / ${CT_DISK} GB on ${ROOT_STORE}
+  network       ${NET0}
+  login         $( [ -n "$CT_SSHKEY" ] && echo "SSH key $CT_SSHKEY" || echo "root password (pct will ask)" )
+  then          $( [ "$RUN_INSTALLER" = "1" ] && echo "install Docker and vnc-gateway inside it" || echo "nothing (RUN_INSTALLER=0)" )
+
+PLAN
+
+if [ "$CONFIRM" != "yes" ]; then
+  if [ -t 0 ]; then
+    printf '  Create it? [y/N] '
+    read -r go || go=""
+    case "$go" in
+      [yY]*) ;;
+      *) echo "  Nothing was changed."; exit 0 ;;
+    esac
+  else
+    echo "  Dry run. Nothing was changed. Re-run with --yes to apply."
+    exit 0
+  fi
 fi
 
 # --- Create -----------------------------------------------------------------
@@ -347,17 +386,14 @@ if [ "$APPARMOR_OK" = "0" ]; then
 fi
 
 say "Starting..."
-if ! pct start "$CTID" >/dev/null 2>&1; then
-  # Fallback for the case where AppArmor reports as enabled but the profile
-  # still cannot be applied.
-  warn "First start failed; retrying without an AppArmor profile..."
-  set_unconfined
-  if ! pct start "$CTID"; then
-    warn "Still failing. Get the real error with:"
-    warn "    lxc-start -n $CTID -F -l DEBUG -o /tmp/lxc-$CTID.log"
-    warn "Remove the container with: pct destroy $CTID"
-    die "container $CTID could not be started"
-  fi
+# No automatic "retry without AppArmor": on a kernel that has AppArmor, a failed
+# start has some other cause, and disabling the profile would only weaken the
+# container while hiding the real error.
+if ! pct start "$CTID"; then
+  warn "Get the real error with:"
+  warn "    lxc-start -n $CTID -F -l DEBUG -o /tmp/lxc-$CTID.log"
+  warn "Remove the container with: pct destroy $CTID"
+  die "container $CTID could not be started"
 fi
 
 # --- Wait for the network ---------------------------------------------------
@@ -410,9 +446,10 @@ cat <<EOF
     3. Open http://${CT_ADDR:-<container-ip>}:8088
     4. On Windows, narrow the firewall rule for TCP 5900 to ${CT_ADDR:-<container-ip>} only.
 
-  Update later:  pct exec $CTID -- bash /opt/vnc-gateway/install.sh
+  Update later:  bash update-lxc.sh --ctid $CTID --snapshot --yes
 
-  NOTE: Stage 1 runs with AUTH_MODE=local -- there is NO LOGIN. Keep this on a
-  trusted LAN until Cloudflare Access is configured (Stage 3 in the README).
+  On the LAN there is no login, the same as learnbox: anyone who can reach
+  ${CT_ADDR:-<container-ip>}:8088 can open the desktops in connections.json.
+  For access from outside, follow docs/REMOTE-ACCESS.md -- never forward the port.
 
 EOF

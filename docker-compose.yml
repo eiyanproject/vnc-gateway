@@ -1,9 +1,8 @@
 services:
   guacd:
     # 1.6.0 or newer is required: guacamole/guacd:1.5.x is published for amd64
-    # ONLY, so on an arm64 host (Proxmox on ARM, Pi, Apple silicon) the pull
-    # fails with "no matching manifest for linux/arm64". 1.6.0 is the first
-    # multi-arch tag.
+    # ONLY, so on an arm64 host the pull fails with "no matching manifest for
+    # linux/arm64". 1.6.0 is the first multi-arch tag.
     image: guacamole/guacd:1.6.0
     container_name: vncgw-guacd
     restart: unless-stopped
@@ -11,13 +10,29 @@ services:
     # NOTE: no `ports:` on purpose. guacd must never be reachable from outside
     # this compose network -- it has no authentication of any kind.
     extra_hosts:
-      # guacd is the process that actually opens the RFB/TCP connection, so the
-      # target hostname must resolve *here*. This mapping makes the literal name
-      # "host.docker.internal" point at the Docker host machine on Linux too.
+      # guacd is the process that opens the RFB/TCP connection, so the target
+      # name must resolve *here*. Maps "host.docker.internal" to the Docker
+      # host on Linux too (Docker Desktop has it built in).
       - "host.docker.internal:host-gateway"
+    volumes:
+      # Written only when RECORDING=1. Must be owned by uid 1000 (guacd);
+      # install.sh creates it that way.
+      - ./recordings:/recordings
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      # journald when the host runs it (install.sh sets LOG_DRIVER), so the
+      # lines reach VictoriaLogs through the guest's rsyslog. Otherwise
+      # `local`, which rotates by itself -- json-file does not, and fills disks.
+      driver: ${LOG_DRIVER:-local}
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        VNCGW_COMMIT: ${VNCGW_COMMIT:-unknown}
     container_name: vncgw-app
     restart: unless-stopped
     depends_on: [guacd]
@@ -27,12 +42,17 @@ services:
       GUACD_HOST: guacd
       GUACD_PORT: "4822"
     ports:
-      # STAGE 1 (local): published so you can hit http://localhost:<HOST_PORT>.
-      # STAGE 3 (cloudflare): change to "127.0.0.1:${HOST_PORT}:8080" so only
-      # cloudflared can reach it.
+      # Reachable on the LAN by design: the OCI box's Caddy reaches it over the
+      # Tailscale subnet route. Public hostnames are gated by ACCESS_* in .env,
+      # not by hiding the port.
       - "${HOST_PORT:-8088}:8080"
     volumes:
       - ./connections.json:/app/connections.json:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: ${LOG_DRIVER:-local}
 
 networks:
   vncgw:

@@ -1,60 +1,184 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const path = require('path');
+const { EventEmitter } = require('events');
 const express = require('express');
 const GuacamoleLite = require('guacamole-lite');
 
 const config = require('./config');
-const { authenticate } = require('./auth');
+const log = require('./log');
+const metrics = require('./metrics');
+const guard = require('./guard');
 const { checkTarget } = require('./allowlist');
 const sessions = require('./sessions');
+const { createLimiter } = require('./ratelimit');
+
+const limitSessions = createLimiter({ perMinute: config.sessionsPerMinute });
+
+// Saved connections may name who can use them. LAN callers have no identity to
+// check against and are trusted the same way learnbox trusts them; the list
+// constrains people arriving through Cloudflare Access.
+function canUse(identity, conn) {
+  if (!conn.allowedUsers) return true;
+  if (identity.via === 'lan') return true;
+  return conn.allowedUsers.includes(identity.email);
+}
 
 const app = express();
-app.use(express.json());
-
 app.disable('x-powered-by');
+
+// ---------------------------------------------------------------- metrics/log
 app.use((req, res, next) => {
-  // Belt-and-braces. Cloudflare Access will already 302 any crawler to a login
-  // page, but this costs nothing and covers the window before that exists.
-  res.set('X-Robots-Tag', 'noindex, nofollow');
-  res.set('X-Content-Type-Options', 'nosniff');
-  res.set('Referrer-Policy', 'no-referrer');
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const route = req.route ? req.route.path : (res.locals.route || 'unmatched');
+    const secs = Number(process.hrtime.bigint() - start) / 1e9;
+    metrics.requests.inc({ route, method: req.method, status: String(res.statusCode) });
+    metrics.duration.observe({ route }, secs);
+    // Log changes and failures. Successful reads would drown everything else.
+    if (req.method !== 'GET' || res.statusCode >= 400) {
+      const level = res.statusCode >= 500 ? 'error' : 'info';
+      log[level]('request', { route, method: req.method, status: res.statusCode, dur_ms: Math.round(secs * 1000) });
+    }
+  });
   next();
 });
 
-app.use(express.static(path.join(__dirname, '..', 'public')));
+// ---------------------------------------------------------------- the gate
+app.use(async (req, res, next) => {
+  let v;
+  try {
+    v = await guard.evaluate(req);
+  } catch (err) {
+    metrics.errors.inc({ kind: 'internal' });
+    log.error('guard failed', { error: err.message });
+    res.locals.route = 'guard';
+    return res.status(500).json({ error: 'internal error' });
+  }
+  if (!v.ok) {
+    metrics.errors.inc({ kind: v.kind });
+    log.warn('request refused', {
+      host: guard.hostOnly(req.headers.host).slice(0, 100), path: req.path.slice(0, 100),
+      status: v.status, kind: v.kind, reason: v.reason,
+    });
+    res.locals.route = 'guard';
+    return res.status(v.status).json({ error: v.error });
+  }
+  req.identity = v.identity;
 
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, authMode: config.authMode, guacd: config.guacd });
+  // Drive-by POSTs: a custom header cannot be sent cross-site without a CORS
+  // preflight, which is never approved. Origin is checked as well because it
+  // costs nothing and covers clients that do send it.
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (req.headers['x-vncgw'] !== '1' || !guard.originMatches(req)) {
+      metrics.errors.inc({ kind: 'csrf_rejected' });
+      res.locals.route = 'guard';
+      return res.status(403).json({ error: 'cross-site request refused' });
+    }
+  }
+  next();
 });
 
+app.use((req, res, next) => {
+  const host = req.headers.host;
+  res.set('X-Robots-Tag', 'noindex, nofollow');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('X-Frame-Options', 'DENY');
+  // ws:/wss: listed explicitly: older Safari does not treat them as 'self'.
+  res.set('Content-Security-Policy', [
+    "default-src 'self'",
+    `connect-src 'self' ws://${host} wss://${host}`,
+    "img-src 'self' data: blob:",
+    "script-src 'self'",
+    "style-src 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join('; '));
+  next();
+});
+
+// Bodies are parsed only for requests that already passed the gate.
+app.use(express.json({ limit: '8kb' }));
+
+// ----------------------------------------------------------- service contract
+app.get('/healthz', (req, res) => {
+  res.json({ status: 'ok', version: config.version });
+});
+
+function guacdReachable(timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const sock = net.connect(config.guacd.port, config.guacd.host);
+    const done = (ok) => { sock.destroy(); resolve(ok); };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+app.get('/readyz', async (req, res) => {
+  const problems = [];
+  if (!(await guacdReachable())) problems.push(`guacd unreachable at ${config.guacd.host}:${config.guacd.port}`);
+  if (config.accessHosts.length && !guard.accessConfigured) {
+    problems.push('ACCESS_HOSTS is set without ACCESS_TEAM_DOMAIN and ACCESS_AUD');
+  }
+  if (problems.length) {
+    metrics.errors.inc({ kind: 'not_ready' });
+    return res.status(503).json({ status: 'unavailable', problems });
+  }
+  res.json({ status: 'ready' });
+});
+
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', metrics.register.contentType);
+  res.end(await metrics.register.metrics());
+});
+
+// ------------------------------------------------------------------------ API
 // The browser gets labels and IDs only -- never hostnames or passwords.
-app.get('/api/connections', authenticate, (req, res) => {
+app.get('/api/connections', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.json({
-    user: req.user.email,
+    user: req.identity.email,
+    via: req.identity.via,
     freeformEnabled: config.allowedCidrs.length > 0,
-    connections: config.connections.map((c) => ({ id: c.id, label: c.label })),
+    recording: config.recording.enabled,
+    connections: config.connections
+      .filter((c) => canUse(req.identity, c))
+      .map((c) => ({ id: c.id, label: c.label })),
   });
 });
 
-// Mint a session. Body is either { connectionId } or { host, port }.
-app.post('/api/sessions', authenticate, (req, res) => {
+// Mint a session. Body is either { connectionId } or { host, port, password }.
+app.post('/api/sessions', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const id = req.identity;
+  const key = id.via === 'access' ? `a:${id.email}` : `l:${req.socket.remoteAddress}`;
+  const rl = limitSessions(key);
+  if (!rl.ok) {
+    metrics.errors.inc({ kind: 'rate_limited' });
+    log.warn('session rate limited', { user: id.email, via: id.via });
+    res.set('Retry-After', String(rl.retryAfter));
+    return res.status(429).json({ error: `too many session requests; retry in ${rl.retryAfter}s` });
+  }
+
   const { connectionId, host, port, width, height } = req.body || {};
 
   if (connectionId) {
     const conn = config.connections.find((c) => c.id === connectionId);
-    if (!conn) return res.status(404).json({ error: 'no such connection' });
-
-    // [STAGE 4] Per-user authorisation goes here: check req.user.email against
-    // an allowed-users list on the connection before minting.
+    // Not permitted and not existing answer the same, so the list of saved
+    // connections cannot be probed by someone who may not see it.
+    if (!conn || !canUse(id, conn)) {
+      metrics.errors.inc({ kind: 'connection_denied' });
+      log.warn('session denied', { user: id.email, via: id.via, connectionId: String(connectionId).slice(0, 60) });
+      return res.status(404).json({ error: 'no such connection' });
+    }
     return res.json(sessions.mint({
-      user: req.user,
-      hostname: conn.hostname,
-      port: conn.port,
-      password: conn.password,
-      label: conn.label,
-      width, height,
+      identity: id, hostname: conn.hostname, port: conn.port, password: conn.password,
+      label: conn.label, kind: 'saved', width, height,
     }));
   }
 
@@ -62,63 +186,116 @@ app.post('/api/sessions', authenticate, (req, res) => {
     const p = parseInt(port, 10) || 5900;
     const verdict = checkTarget(String(host), p);
     if (!verdict.ok) {
-      console.warn(`[allowlist] DENIED ${req.user.email} -> ${host}:${p} (${verdict.reason})`);
+      metrics.errors.inc({ kind: 'allowlist_denied' });
+      log.warn('session denied', { user: id.email, via: id.via, target: `${String(host).slice(0, 60)}:${p}`, reason: verdict.reason });
       return res.status(403).json({ error: verdict.reason });
     }
+    const pw = typeof req.body.password === 'string' ? req.body.password.slice(0, 256) : '';
     return res.json(sessions.mint({
-      user: req.user,
-      hostname: String(host),
-      port: p,
-      password: req.body.password || '',
-      label: `ad-hoc ${host}:${p}`,
-      width, height,
+      identity: id, hostname: String(host), port: p, password: pw,
+      label: `${host}:${p}`, kind: 'freeform', width, height,
     }));
   }
 
   res.status(400).json({ error: 'need connectionId or host' });
 });
 
-const server = http.createServer(app);
+app.use((req, res, next) => { res.locals.route = 'static'; next(); });
+app.use(express.static(path.join(__dirname, '..', 'public'), { index: 'index.html' }));
 
-// Gate the WebSocket upgrade BEFORE guacamole-lite gets a look at it. Node runs
-// every 'upgrade' listener in registration order, so destroying the socket here
-// means guacamole-lite's handshake lands on a dead socket and goes nowhere.
-// This listener must be registered before the GuacamoleLite constructor below.
-server.on('upgrade', (req, socket) => {
-  const sid = new URL(req.url, 'http://localhost').searchParams.get('sid');
-  if (!sessions.claim(sid)) {
-    console.warn('[ws] rejected upgrade: missing/expired/replayed sid');
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-    socket.destroy();
+// ------------------------------------------------------------------ websocket
+// guacamole-lite is handed a stand-in "server" that only ever emits upgrades we
+// have already accepted. The gate is async (it may fetch Access signing keys),
+// and Node runs 'upgrade' listeners synchronously, so attaching guacamole-lite
+// to the real server would let it handshake before the verdict arrived.
+const server = http.createServer(app);
+const acceptedUpgrades = new EventEmitter();
+
+function refuseUpgrade(socket, status, kind, fields) {
+  metrics.errors.inc({ kind });
+  log.warn('websocket refused', { status, kind, ...fields });
+  if (!socket.destroyed) {
+    socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   }
+}
+
+server.on('upgrade', (req, socket, head) => {
+  socket.on('error', () => {}); // a client hanging up mid-check is not a crash
+  (async () => {
+    const v = await guard.evaluate(req);
+    if (!v.ok) return refuseUpgrade(socket, v.status, v.kind, { reason: v.reason });
+    if (!guard.originMatches(req)) {
+      return refuseUpgrade(socket, 403, 'origin_rejected', { origin: String(req.headers.origin).slice(0, 100) });
+    }
+    const sid = new URL(req.url, 'http://placeholder').searchParams.get('sid');
+    const c = sessions.claim(sid, v.identity);
+    if (!c.ok) return refuseUpgrade(socket, 401, 'sid_rejected', { reason: c.reason, user: v.identity.email });
+
+    metrics.sessionsTotal.inc({ kind: c.entry.kind });
+    log.info('session opened', { user: v.identity.email, via: v.identity.via, target: c.entry.target, label: c.entry.label });
+    // Replace whatever the client sent with the token minted for this sid.
+    // guacamole-lite reads only req.url, so nothing client-supplied reaches it.
+    req.url = `/?token=${encodeURIComponent(c.entry.guacToken)}`;
+    acceptedUpgrades.emit('upgrade', req, socket, head);
+  })().catch((err) => {
+    log.error('upgrade failed', { error: err.message });
+    refuseUpgrade(socket, 500, 'internal', {});
+  });
 });
 
 const guacServer = new GuacamoleLite(
-  { server },
+  { server: acceptedUpgrades },
   { host: config.guacd.host, port: config.guacd.port },
   {
     crypt: { cypher: 'AES-256-CBC', key: config.tokenKey },
-
-    // Log levels are numeric in guacamole-lite (QUIET 0 / ERRORS 10 / NORMAL 20
-    // / VERBOSE 30 / DEBUG 40) and compared numerically -- passing the string
-    // 'NORMAL' silently disables logging. 20 is also as high as you want to go
-    // in production: the noisier levels dump connection settings, and those
-    // contain the VNC password.
-    log: { level: 20 },
-
-    // Default is 10s, which is tight once there's a tunnel and a CDN in the
-    // path. [STAGE 3: CLOUDFLARE] keep an eye on this if sessions drop when idle.
+    // Numeric levels, compared numerically. Anything above 20 (NORMAL) dumps
+    // connection settings, and those contain the VNC password.
+    log: {
+      level: 10,
+      stdLog: (...a) => log.debug('guacamole-lite', { detail: a.join(' ').slice(0, 300) }),
+      errorLog: (...a) => log.warn('guacamole-lite', { detail: a.join(' ').slice(0, 300) }),
+    },
+    // Default is 10s, tight with a tunnel and a CDN in the path. The client
+    // pings every 500 ms anyway, so this only fires on a truly dead peer.
     maxInactivityTime: 60000,
   }
 );
 
-guacServer.on('error', (clientConnection, err) => {
-  console.error('[guacd] ' + err.message);
+let active = 0;
+guacServer.on('open', () => { active += 1; metrics.activeSessions.set(active); });
+guacServer.on('close', () => { active = Math.max(0, active - 1); metrics.activeSessions.set(active); });
+guacServer.on('error', (conn, err) => {
+  metrics.errors.inc({ kind: 'guacd' });
+  log.warn('guacd connection error', { error: err && err.message ? err.message : String(err) });
 });
 
 server.listen(config.port, () => {
-  console.log(`vnc-gateway listening on :${config.port}  (auth=${config.authMode}, guacd=${config.guacd.host}:${config.guacd.port})`);
-  if (config.authMode === 'local') {
-    console.log('  !! AUTH_MODE=local -- no login. Do not expose this beyond your LAN.');
-  }
+  log.info('listening', {
+    port: config.port,
+    version: config.version,
+    commit: config.commit,
+    guacd: `${config.guacd.host}:${config.guacd.port}`,
+    allowed_hosts: config.allowedHosts,
+    access_hosts: config.accessHosts,
+    access: config.accessHosts.length ? (guard.accessConfigured ? 'enforced' : 'UNCONFIGURED - access hosts answer 503') : 'no public hostnames',
+    freeform_cidrs: config.allowedCidrs,
+    recording: config.recording.enabled,
+  });
 });
+
+// A crash should still arrive as one JSON line, then let Docker restart us.
+process.on('uncaughtException', (err) => {
+  log.error('uncaught exception', { error: err.message, stack: String(err.stack).split('\n').slice(0, 6).join(' | ') });
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  log.error('unhandled rejection', { error: err && err.message ? err.message : String(err) });
+});
+
+function shutdown(sig) {
+  log.info('shutting down', { signal: sig });
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
