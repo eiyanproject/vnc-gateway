@@ -2,6 +2,8 @@
 
 State of the project as of 2026-11-21 (version 0.3.0).
 
+Open work is tracked in [TODO.md](../TODO.md).
+
 ## 0.3.0 -- the user flow
 
 - **Kept profiles**: name, host and port on the gateway (`data/profiles.json`),
