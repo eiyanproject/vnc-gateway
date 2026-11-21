@@ -33,6 +33,13 @@ function safeName(s) {
   return String(s).replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60);
 }
 
+// One key per desktop. Two names for the same machine (an IP and a hostname)
+// are not detected as the same desktop; keep connections.json and profiles on
+// IP addresses to make the lock reliable.
+function targetKey(hostname, port) {
+  return `${String(hostname).toLowerCase()}:${port}`;
+}
+
 function clampDim(n, fallback) {
   const v = parseInt(n, 10);
   return Number.isInteger(v) && v >= 200 && v <= 8192 ? v : fallback;
@@ -78,7 +85,7 @@ function mint({ identity, hostname, port, password, width, height, label, kind }
   handles.set(sid, {
     expiresAt: Date.now() + config.sessionTtlMs,
     identity,
-    target: `${hostname}:${port}`,
+    target: targetKey(hostname, port),
     label,
     kind,
     guacToken,
@@ -112,4 +119,73 @@ setInterval(() => {
   for (const [sid, entry] of handles) if (now > entry.expiresAt) handles.delete(sid);
 }, 60_000).unref();
 
-module.exports = { mint, claim };
+// ---------------------------------------------------------------------------
+// One open session per desktop.
+//
+// Someone else's session on the same desktop: refused. Your own (another tab,
+// or a dropped session the server has not noticed yet): taken over -- the old
+// one is closed with a message first. Either way there are never two, and
+// Reconnect after a network drop is not blocked by your own dead session.
+// ---------------------------------------------------------------------------
+const active = new Map(); // target -> { target, identity, since, lastInput, socket, conn }
+
+const sameIdentity = (a, b) => a.email === b.email && a.via === b.via;
+
+function occupant(target) {
+  return active.get(target) || null;
+}
+
+// The Guacamole protocol's own error instruction, so the browser can show why
+// it was disconnected. 776 = CLIENT_TIMEOUT / session closed by the server.
+function guacError(message) {
+  return `5.error,${[...message].length}.${message},3.776;`;
+}
+
+function end(entry, message) {
+  if (active.get(entry.target) === entry) active.delete(entry.target);
+  if (entry.conn) {
+    try { entry.conn.send(guacError(message)); } catch { /* already gone */ }
+    entry.conn.close();
+  } else {
+    entry.socket.destroy(); // not handed to guacd yet
+  }
+}
+
+function reserve(target, identity, socket) {
+  const current = active.get(target);
+  if (current && !sameIdentity(current.identity, identity)) {
+    return { ok: false, since: current.since };
+  }
+  if (current) end(current, 'This desktop was opened in another window.');
+  const entry = { target, identity, since: Date.now(), lastInput: Date.now(), socket, conn: null };
+  active.set(target, entry);
+  // Released when the connection ends, whichever side ends it. The identity
+  // check stops a late close of an old session releasing its successor.
+  socket.once('close', () => { if (active.get(target) === entry) active.delete(target); });
+  return { ok: true, entry, tookOver: Boolean(current) };
+}
+
+// Mouse, key and clipboard instructions from the browser are what "in use"
+// means. sync/nop/ping traffic flows constantly and must not count.
+const INPUT = /(?:^|;)\d+\.(?:mouse|key|clipboard),/;
+
+function attach(target, conn) {
+  const entry = active.get(target);
+  if (!entry) return;
+  entry.conn = conn;
+  conn.webSocket.on('message', (msg) => {
+    if (INPUT.test(msg.toString())) entry.lastInput = Date.now();
+  });
+}
+
+// Closes sessions with no input for longer than timeoutMs; returns them.
+function sweepIdle(timeoutMs, now = Date.now()) {
+  if (!timeoutMs) return [];
+  const idle = [...active.values()].filter((e) => e.conn && now - e.lastInput > timeoutMs);
+  const minutes = Math.round(timeoutMs / 60_000);
+  const label = minutes >= 1 ? `${minutes} minute${minutes === 1 ? '' : 's'}` : `${Math.round(timeoutMs / 1000)} seconds`;
+  for (const e of idle) end(e, `Disconnected after ${label} without input.`);
+  return idle;
+}
+
+module.exports = { mint, claim, targetKey, occupant, reserve, attach, sweepIdle, sameIdentity };

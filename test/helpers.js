@@ -6,8 +6,10 @@
 
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const path = require('path');
 const http = require('http');
+const { spawn } = require('child_process');
 
 const KEY = 'test-key-0123456789abcdefghijklm'; // exactly 32 bytes
 
@@ -27,6 +29,7 @@ function baseEnv(extra = {}) {
     ]),
     ALLOWED_CIDRS: '192.168.0.0/24',
     ALLOWED_PORTS: '5900,5901',
+    DATA_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'vncgw-data-')),
     LOG_LEVEL: 'error',
     ...extra,
   };
@@ -68,4 +71,43 @@ async function startJwks() {
   return { url, sign, otherKey: other.privateKey, close: () => server.close() };
 }
 
-module.exports = { KEY, baseEnv, applyEnv, startJwks, writeConnections };
+function freePort() {
+  return new Promise((resolve) => {
+    const s = net.createServer().listen(0, '127.0.0.1', () => {
+      const { port } = s.address();
+      s.close(() => resolve(port));
+    });
+  });
+}
+
+// Boots the real server (src/index.js) in a child process and waits for it.
+async function startServer(env) {
+  const port = await freePort();
+  let logs = '';
+  const proc = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'index.js')], {
+    env: { ...process.env, ...env, PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proc.stdout.on('data', (d) => { logs += d; });
+  proc.stderr.on('data', (d) => { logs += d; });
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${base}/healthz`)).ok) return { base, logs: () => logs, kill: () => proc.kill() }; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  proc.kill();
+  throw new Error(`server did not start:
+${logs}`);
+}
+
+// A "guacd" that accepts connections and never answers. guacamole-lite then
+// holds the WebSocket open, which keeps a session in the desktop lock -- enough
+// to test the lock without a real VNC server.
+async function startSilentGuacd() {
+  const sockets = [];
+  const server = net.createServer((s) => { sockets.push(s); s.on('error', () => {}); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { port: server.address().port, close: () => { sockets.forEach((s) => s.destroy()); server.close(); } };
+}
+
+module.exports = { KEY, baseEnv, applyEnv, startJwks, writeConnections, freePort, startServer, startSilentGuacd };

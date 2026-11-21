@@ -9,6 +9,7 @@ const assert = require('node:assert/strict');
 const { spawn } = require('child_process');
 const net = require('net');
 const path = require('path');
+const fs = require('fs');
 const WebSocket = require('ws');
 const { baseEnv, startJwks } = require('../helpers');
 
@@ -21,6 +22,7 @@ let proc;
 let base;
 let jwks;
 let logs = '';
+let dataDir;
 
 function freePort() {
   return new Promise((resolve) => {
@@ -36,22 +38,21 @@ test.before(async () => {
   const port = await freePort();
   const deadGuacd = await freePort(); // nothing listens here
   base = `http://127.0.0.1:${port}`;
+  const env = baseEnv({
+    PORT: String(port),
+    GUACD_HOST: '127.0.0.1',
+    GUACD_PORT: String(deadGuacd),
+    ALLOWED_HOSTS: 'vnc-gateway',
+    ACCESS_HOSTS: PUBLIC,
+    ACCESS_TEAM_DOMAIN: TEAM,
+    ACCESS_AUD: AUD,
+    ACCESS_CERTS_URL: jwks.url,
+    SESSIONS_PER_MINUTE: '40',
+    LOG_LEVEL: 'debug',
+  });
+  dataDir = env.DATA_DIR;
   proc = spawn(process.execPath, [path.join(__dirname, '..', '..', 'src', 'index.js')], {
-    env: {
-      ...process.env,
-      ...baseEnv({
-        PORT: String(port),
-        GUACD_HOST: '127.0.0.1',
-        GUACD_PORT: String(deadGuacd),
-        ALLOWED_HOSTS: 'vnc-gateway',
-        ACCESS_HOSTS: PUBLIC,
-        ACCESS_TEAM_DOMAIN: TEAM,
-        ACCESS_AUD: AUD,
-        ACCESS_CERTS_URL: jwks.url,
-        SESSIONS_PER_MINUTE: '40',
-        LOG_LEVEL: 'debug',
-      }),
-    },
+    env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   proc.stdout.on('data', (d) => { logs += d; });
@@ -235,6 +236,72 @@ test('WebSocket on the public hostname needs a token, and the same identity that
 
   const lanSid = (await post({ connectionId: 'desk' })).json.sid;
   assert.equal(await ws({ sid: lanSid, host: PUBLIC, headers: auth }), 401, 'LAN handle via public name');
+});
+
+// ---------------------------------------------------------------- profiles
+const papi = (method, p, body, opts = {}) =>
+  request(method, p, { body, ...opts, headers: { 'x-vncgw': '1', ...(opts.headers || {}) } });
+
+test('profiles: keep, list, rename, delete -- and never the password', async () => {
+  const kept = await papi('POST', '/api/profiles', { name: 'Lab', host: '192.168.0.50', port: 5900, password: 'MUST-NOT-BE-STORED' });
+  assert.equal(kept.status, 201);
+  assert.deepEqual(Object.keys(kept.json).sort(), ['createdAt', 'host', 'id', 'name', 'port']);
+  const onDisk = fs.readFileSync(path.join(dataDir, 'profiles.json'), 'utf8');
+  assert.ok(onDisk.includes('192.168.0.50'));
+  assert.ok(!onDisk.includes('MUST-NOT-BE-STORED'), 'password reached the profile store');
+
+  const list = await request('GET', '/api/connections');
+  const mine = list.json.profiles.find((p) => p.id === kept.json.id);
+  assert.deepEqual({ name: mine.name, host: mine.host, port: mine.port, busy: mine.busy }, { name: 'Lab', host: '192.168.0.50', port: 5900, busy: null });
+
+  const renamed = await papi('PATCH', `/api/profiles/${kept.json.id}`, { name: 'Lab box' });
+  assert.equal(renamed.json.name, 'Lab box');
+  assert.equal((await papi('DELETE', `/api/profiles/${kept.json.id}`)).status, 204);
+  assert.equal((await papi('DELETE', `/api/profiles/${kept.json.id}`)).status, 404);
+});
+
+test('profiles: state-changing calls need the CSRF header', async () => {
+  assert.equal((await request('POST', '/api/profiles', { body: { host: '192.168.0.51' } })).status, 403);
+  const kept = await papi('POST', '/api/profiles', { host: '192.168.0.52' });
+  assert.equal((await request('DELETE', `/api/profiles/${kept.json.id}`)).status, 403);
+  assert.equal((await papi('DELETE', `/api/profiles/${kept.json.id}`)).status, 204);
+});
+
+test('profiles: only addresses you could connect to can be kept', async () => {
+  assert.equal((await papi('POST', '/api/profiles', { host: '8.8.8.8' })).status, 403);
+  assert.equal((await papi('POST', '/api/profiles', { host: 'nas.lan' })).status, 403);
+  assert.equal((await papi('POST', '/api/profiles', { host: '192.168.0.53', port: 22 })).status, 403);
+  const a = await papi('POST', '/api/profiles', { host: '192.168.0.53' });
+  assert.equal(a.status, 201);
+  assert.equal(a.json.name, '192.168.0.53:5900', 'unnamed profiles are named after their address');
+  assert.equal((await papi('POST', '/api/profiles', { host: '192.168.0.53', port: 5900 })).status, 409);
+  await papi('DELETE', `/api/profiles/${a.json.id}`);
+});
+
+test('profiles: each Access user has their own; LAN has its own', async () => {
+  const lan = await papi('POST', '/api/profiles', { name: 'LAN one', host: '192.168.0.54' });
+  const other = { host: PUBLIC, headers: { 'cf-access-jwt-assertion': await token('other@example.com') } };
+  const owner = { host: PUBLIC, headers: { 'cf-access-jwt-assertion': await token('owner@example.com') } };
+
+  const theirs = await papi('POST', '/api/profiles', { name: 'Theirs', host: '192.168.0.55' }, other);
+  assert.equal(theirs.status, 201);
+
+  const seenByOther = (await request('GET', '/api/connections', other)).json.profiles.map((p) => p.name);
+  const seenByOwner = (await request('GET', '/api/connections', owner)).json.profiles.map((p) => p.name);
+  const seenByLan = (await request('GET', '/api/connections')).json.profiles.map((p) => p.name);
+  assert.deepEqual(seenByOther, ['Theirs']);
+  assert.deepEqual(seenByOwner, []);
+  assert.ok(seenByLan.includes('LAN one') && !seenByLan.includes('Theirs'));
+
+  assert.equal((await papi('DELETE', `/api/profiles/${lan.json.id}`, undefined, other)).status, 404, "cannot delete someone else's");
+  assert.equal((await papi('PATCH', `/api/profiles/${lan.json.id}`, { name: 'x' }, other)).status, 404);
+  assert.equal((await post({ profileId: lan.json.id, password: 'x' }, other)).status, 404, "cannot connect with someone else's");
+
+  const ok = await post({ profileId: theirs.json.id, password: 'pw' }, other);
+  assert.equal(ok.status, 200);
+  assert.ok(ok.json.sid);
+  await papi('DELETE', `/api/profiles/${lan.json.id}`);
+  await papi('DELETE', `/api/profiles/${theirs.json.id}`, undefined, other);
 });
 
 // ------------------------------------------------------------ rate limiting

@@ -14,14 +14,22 @@ services:
     ports: !reset []
     volumes: !override
       - ./test/e2e/connections.json:/app/connections.json:ro
+      - e2e-data:/app/data
 
   vnc:
     build: test/e2e/vnc
     container_name: vncgw-e2e-vnc
-    networks: [vncgw]
+    networks:
+      vncgw:
+        # A fixed address inside ALLOWED_CIDRS, so the test can keep it as a
+        # profile: profiles and free-form targets must be IP literals.
+        ipv4_address: 172.30.99.10
     volumes:
       - e2e-shared:/shared
       - e2e-recordings:/recordings
+      # Only here so start.sh can hand it to uid 1000 (the app user); a fresh
+      # named volume belongs to root.
+      - e2e-data:/appdata
 
   browser:
     image: mcr.microsoft.com/playwright:v1.64.1-noble
@@ -41,6 +49,13 @@ services:
       - -c
       - mkdir -p /e2e && cp -r /e2e-src/. /e2e && cd /e2e && npm install --no-audit --no-fund --silent && node test.mjs
 
+networks:
+  vncgw:
+    ipam:
+      config:
+        - subnet: 172.30.99.0/24
+
 volumes:
   e2e-shared:
   e2e-recordings:
+  e2e-data:

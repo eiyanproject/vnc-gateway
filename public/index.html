@@ -25,18 +25,21 @@
   </header>
 
   <main id="picker">
-    <h2>Saved connections</h2>
-    <ul id="connections"></ul>
+    <h2>Desktops</h2>
+    <ul id="desktops"></ul>
+    <p id="empty" class="hint" hidden>Nothing here yet. Connect to an address below and press <b>Keep profile</b> to find it here next time.</p>
 
-    <section id="freeform" hidden>
-      <h2>Connect to an address</h2>
-      <p class="hint">Limited to the networks and ports in <code>ALLOWED_CIDRS</code> / <code>ALLOWED_PORTS</code>.</p>
+    <section id="new" hidden>
+      <h2>New connection</h2>
       <form id="adhoc">
-        <input id="host" placeholder="192.168.0.50" autocomplete="off" required inputmode="decimal">
-        <input id="port" placeholder="5900" value="5900" size="6" autocomplete="off" inputmode="numeric">
+        <input id="name" placeholder="Name (optional)" maxlength="60" autocomplete="off">
+        <input id="host" placeholder="192.168.0.50" required autocomplete="off" inputmode="decimal">
+        <input id="port" value="5900" size="6" autocomplete="off" inputmode="numeric" aria-label="Port">
         <input id="password" type="password" placeholder="VNC password" autocomplete="off">
-        <button type="submit">Connect</button>
+        <button type="submit" class="primary">Connect</button>
+        <button type="button" id="keep">Keep profile</button>
       </form>
+      <p class="hint">Keep profile saves the name, address and port on the gateway &mdash; never the password.</p>
     </section>
 
     <p id="recording-note" class="hint" hidden>Sessions on this gateway are recorded.</p>
@@ -56,6 +59,21 @@
        document, so typing in the clipboard box never reaches the remote. -->
   <div id="viewport" tabindex="0" hidden>
     <div id="display"></div>
+  </div>
+
+  <div id="ended" class="overlay" hidden role="dialog" aria-modal="true" aria-labelledby="ended-msg">
+    <div class="card">
+      <p id="ended-msg"></p>
+      <div class="row">
+        <button id="reconnect" type="button" class="primary">Reconnect</button>
+        <button id="back" type="button">Back to list</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="idle-warning" class="toast" role="status" hidden>
+    <span id="idle-text"></span>
+    <button id="stay" type="button">Stay connected</button>
   </div>
 
   <script src="vendor/guacamole-common.js"></script>

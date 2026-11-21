@@ -1,6 +1,42 @@
 # Handover
 
-State of the project as of 2026-11-18 (version 0.2.0).
+State of the project as of 2026-11-21 (version 0.3.0).
+
+## 0.3.0 -- the user flow
+
+- **Kept profiles**: name, host and port on the gateway (`data/profiles.json`),
+  per Access user, one shared list for the LAN. Never a password: only those
+  three fields are read from the request. Only addresses that pass the
+  allowlist can be kept, and they are re-checked on every connect.
+- **One combined list**: shared connections and profiles; profiles ask for the
+  password inline. Rename and delete in place.
+- **One session per desktop** (`sessions.reserve`): someone else's open session
+  is a 409 with "in use since"; your own is taken over and told so. Checked at
+  mint and again at the WebSocket upgrade, because two handles can be minted
+  before either is used.
+- **Idle close**: the server closes sessions after `IDLE_TIMEOUT_MINUTES`
+  (default 15) without mouse/key/clipboard input, sending the reason through the
+  Guacamole protocol. The page warns first and has "Stay connected".
+- **Reconnect / Back to list** dialog when a session ends; busy state on every
+  connect button; Fit/1:1 and last-used desktop remembered per browser.
+
+Verified: 61 unit + integration tests (the lock runs against a real server
+with a silent stand-in guacd), and 36 end-to-end checks passing on two
+consecutive runs. The E2E caught two UI bugs before release: the Fit/1:1 label
+could be wrong right after connecting, and with 1:1 remembered an empty hidden
+viewport covered the list and swallowed every click (`#viewport.one-to-one`
+outranked `[hidden]`). `test/e2e/out/list.png` is a screenshot of the list.
+
+Decisions taken with the user (2026-11-21): profiles on the gateway rather
+than in the browser (the LAN address and the public hostname are different
+origins, so browser storage would split the list). Taken without asking, easy
+to change: same-person takeover instead of refusal (otherwise Reconnect after a
+network drop is blocked by your own dead session for up to a minute); 15-minute
+default; the lock compares the address as written.
+
+---
+
+## 0.2.0
 
 ## Where it stands
 

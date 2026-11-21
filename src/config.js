@@ -84,6 +84,12 @@ const accessTeamDomain = (process.env.ACCESS_TEAM_DOMAIN || '')
   .trim().replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase();
 const accessAud = (process.env.ACCESS_AUD || '').trim();
 
+// Minutes without mouse or keyboard input before a session is closed. 0 = never.
+const idleTimeoutMinutes = parseFloat(process.env.IDLE_TIMEOUT_MINUTES || '15');
+if (!Number.isFinite(idleTimeoutMinutes) || idleTimeoutMinutes < 0) {
+  fatal(`IDLE_TIMEOUT_MINUTES must be a number of minutes (0 disables), got "${process.env.IDLE_TIMEOUT_MINUTES}"`);
+}
+
 if (process.env.AUTH_MODE) {
   log.warn('AUTH_MODE is obsolete and ignored', {
     hint: 'Cloudflare Access is now per hostname: set ACCESS_HOSTS, ACCESS_TEAM_DOMAIN and ACCESS_AUD',
@@ -103,6 +109,12 @@ module.exports = {
 
   sessionTtlMs: parseInt(process.env.SESSION_TTL_SECONDS || '60', 10) * 1000,
   sessionsPerMinute: parseInt(process.env.SESSIONS_PER_MINUTE || '20', 10),
+  idleTimeoutMs: Math.round(idleTimeoutMinutes * 60_000),
+
+  // Writable volume for kept profiles. Everything else in the container is
+  // read-only.
+  dataDir: path.resolve(__dirname, '..', process.env.DATA_DIR || 'data'),
+  maxProfiles: 50,
 
   allowedCidrs,
   allowedPorts: list('ALLOWED_PORTS').length

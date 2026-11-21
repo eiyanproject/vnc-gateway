@@ -4,6 +4,8 @@ mkdir -p /shared /recordings
 chmod 777 /shared
 # guacd runs as uid 1000 and writes session recordings here.
 chown 1000:1000 /recordings
+# The app (also uid 1000) keeps profiles in this volume.
+if [ -d /appdata ]; then chown 1000:1000 /appdata; fi
 
 echo 'e2e-pass' | vncpasswd -f > /tmp/vncpasswd
 chmod 600 /tmp/vncpasswd

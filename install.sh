@@ -202,11 +202,12 @@ else
 fi
 
 # Secrets: .env holds the token key, connections.json holds VNC passwords. The
-# app runs as uid 1000 in its container and must still read connections.json;
-# guacd (also uid 1000) writes recordings.
+# app runs as uid 1000 in its container and must still read connections.json
+# and write data/ (kept profiles); guacd (also uid 1000) writes recordings.
 chmod 600 .env
 chown 1000:1000 connections.json && chmod 600 connections.json
 mkdir -p recordings && chown 1000:1000 recordings && chmod 700 recordings
+mkdir -p data && chown 1000:1000 data && chmod 700 data
 
 # --- 5. Build and start -----------------------------------------------------
 say "Building and starting $COMMIT ..."

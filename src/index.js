@@ -13,6 +13,7 @@ const metrics = require('./metrics');
 const guard = require('./guard');
 const { checkTarget } = require('./allowlist');
 const sessions = require('./sessions');
+const profiles = require('./profiles');
 const { createLimiter } = require('./ratelimit');
 
 const limitSessions = createLimiter({ perMinute: config.sessionsPerMinute });
@@ -125,6 +126,7 @@ app.get('/readyz', async (req, res) => {
   if (config.accessHosts.length && !guard.accessConfigured) {
     problems.push('ACCESS_HOSTS is set without ACCESS_TEAM_DOMAIN and ACCESS_AUD');
   }
+  if (!profiles.writable()) problems.push(`data directory ${config.dataDir} is not writable`);
   if (problems.length) {
     metrics.errors.inc({ kind: 'not_ready' });
     return res.status(503).json({ status: 'unavailable', problems });
@@ -138,21 +140,56 @@ app.get('/metrics', async (req, res) => {
 });
 
 // ------------------------------------------------------------------------ API
-// The browser gets labels and IDs only -- never hostnames or passwords.
+// Whether this desktop is open right now, from the caller's point of view.
+function busyFor(identity, hostname, port) {
+  const occ = sessions.occupant(sessions.targetKey(hostname, port));
+  if (!occ) return null;
+  return { since: new Date(occ.since).toISOString(), mine: sessions.sameIdentity(occ.identity, identity) };
+}
+
+// Shared connections arrive as labels and IDs only -- never their hostnames or
+// passwords. Profiles are the caller's own, so host and port are included.
 app.get('/api/connections', (req, res) => {
+  const id = req.identity;
   res.set('Cache-Control', 'no-store');
   res.json({
-    user: req.identity.email,
-    via: req.identity.via,
+    user: id.email,
+    via: id.via,
     freeformEnabled: config.allowedCidrs.length > 0,
     recording: config.recording.enabled,
+    idleTimeoutSeconds: Math.round(config.idleTimeoutMs / 1000),
     connections: config.connections
-      .filter((c) => canUse(req.identity, c))
-      .map((c) => ({ id: c.id, label: c.label })),
+      .filter((c) => canUse(id, c))
+      .map((c) => ({ id: c.id, label: c.label, busy: busyFor(id, c.hostname, c.port) })),
+    profiles: profiles.list(id)
+      .map((p) => ({ id: p.id, name: p.name, host: p.host, port: p.port, busy: busyFor(id, p.host, p.port) })),
   });
 });
 
-// Mint a session. Body is either { connectionId } or { host, port, password }.
+// Kept profiles. Only name, host and port are read from the body: a password
+// sent along has nowhere to go.
+app.post('/api/profiles', (req, res) => {
+  const b = req.body || {};
+  const r = profiles.create(req.identity, { name: b.name, host: b.host, port: b.port });
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  log.info('profile kept', { user: req.identity.email, via: req.identity.via, target: `${r.profile.host}:${r.profile.port}` });
+  res.status(201).json(r.profile);
+});
+
+app.patch('/api/profiles/:id', (req, res) => {
+  const r = profiles.rename(req.identity, req.params.id, (req.body || {}).name);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  res.json(r.profile);
+});
+
+app.delete('/api/profiles/:id', (req, res) => {
+  const r = profiles.remove(req.identity, req.params.id);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  log.info('profile removed', { user: req.identity.email, via: req.identity.via });
+  res.status(204).end();
+});
+
+// Mint a session. Body: { connectionId } | { profileId, password } | { host, port, password }.
 app.post('/api/sessions', (req, res) => {
   res.set('Cache-Control', 'no-store');
   const id = req.identity;
@@ -165,39 +202,52 @@ app.post('/api/sessions', (req, res) => {
     return res.status(429).json({ error: `too many session requests; retry in ${rl.retryAfter}s` });
   }
 
-  const { connectionId, host, port, width, height } = req.body || {};
+  const b = req.body || {};
+  const password = typeof b.password === 'string' ? b.password.slice(0, 256) : '';
+  let target;
 
-  if (connectionId) {
-    const conn = config.connections.find((c) => c.id === connectionId);
+  if (b.connectionId) {
+    const conn = config.connections.find((c) => c.id === b.connectionId);
     // Not permitted and not existing answer the same, so the list of saved
     // connections cannot be probed by someone who may not see it.
     if (!conn || !canUse(id, conn)) {
       metrics.errors.inc({ kind: 'connection_denied' });
-      log.warn('session denied', { user: id.email, via: id.via, connectionId: String(connectionId).slice(0, 60) });
+      log.warn('session denied', { user: id.email, via: id.via, connectionId: String(b.connectionId).slice(0, 60) });
       return res.status(404).json({ error: 'no such connection' });
     }
-    return res.json(sessions.mint({
-      identity: id, hostname: conn.hostname, port: conn.port, password: conn.password,
-      label: conn.label, kind: 'saved', width, height,
-    }));
+    target = { hostname: conn.hostname, port: conn.port, password: conn.password, label: conn.label, kind: 'saved' };
+  } else if (b.profileId) {
+    const p = profiles.get(id, String(b.profileId));
+    if (!p) return res.status(404).json({ error: 'no such profile' });
+    target = { hostname: p.host, port: p.port, password, label: p.name, kind: 'freeform' };
+  } else if (b.host) {
+    const p = parseInt(b.port, 10) || 5900;
+    target = { hostname: String(b.host), port: p, password, label: `${b.host}:${p}`, kind: 'freeform' };
+  } else {
+    return res.status(400).json({ error: 'need connectionId, profileId or host' });
   }
 
-  if (host) {
-    const p = parseInt(port, 10) || 5900;
-    const verdict = checkTarget(String(host), p);
+  // Checked on every connect, not only when a profile is kept: ALLOWED_CIDRS
+  // may have been narrowed since.
+  if (target.kind === 'freeform') {
+    const verdict = checkTarget(target.hostname, target.port);
     if (!verdict.ok) {
       metrics.errors.inc({ kind: 'allowlist_denied' });
-      log.warn('session denied', { user: id.email, via: id.via, target: `${String(host).slice(0, 60)}:${p}`, reason: verdict.reason });
+      log.warn('session denied', { user: id.email, via: id.via, target: `${target.hostname.slice(0, 60)}:${target.port}`, reason: verdict.reason });
       return res.status(403).json({ error: verdict.reason });
     }
-    const pw = typeof req.body.password === 'string' ? req.body.password.slice(0, 256) : '';
-    return res.json(sessions.mint({
-      identity: id, hostname: String(host), port: p, password: pw,
-      label: `${host}:${p}`, kind: 'freeform', width, height,
-    }));
   }
 
-  res.status(400).json({ error: 'need connectionId or host' });
+  // One session per desktop. Your own open session is taken over at connect
+  // time; someone else's is a refusal.
+  const busy = busyFor(id, target.hostname, target.port);
+  if (busy && !busy.mine) {
+    metrics.errors.inc({ kind: 'target_busy' });
+    log.warn('session denied', { user: id.email, via: id.via, target: `${target.hostname}:${target.port}`, reason: 'desktop in use' });
+    return res.status(409).json({ error: 'This desktop is already in use by someone else.', since: busy.since });
+  }
+
+  res.json(sessions.mint({ identity: id, ...target, width: b.width, height: b.height }));
 });
 
 app.use((req, res, next) => { res.locals.route = 'static'; next(); });
@@ -231,8 +281,15 @@ server.on('upgrade', (req, socket, head) => {
     const c = sessions.claim(sid, v.identity);
     if (!c.ok) return refuseUpgrade(socket, 401, 'sid_rejected', { reason: c.reason, user: v.identity.email });
 
+    // Re-checked here, not only at mint: two handles for one desktop can be
+    // minted before either is used.
+    const r = sessions.reserve(c.entry.target, v.identity, socket);
+    if (!r.ok) return refuseUpgrade(socket, 409, 'target_busy', { user: v.identity.email, target: c.entry.target });
+
     metrics.sessionsTotal.inc({ kind: c.entry.kind });
-    log.info('session opened', { user: v.identity.email, via: v.identity.via, target: c.entry.target, label: c.entry.label });
+    log.info('session opened', {
+      user: v.identity.email, via: v.identity.via, target: c.entry.target, label: c.entry.label, took_over: r.tookOver,
+    });
     // Replace whatever the client sent with the token minted for this sid.
     // guacamole-lite reads only req.url, so nothing client-supplied reaches it.
     req.url = `/?token=${encodeURIComponent(c.entry.guacToken)}`;
@@ -262,12 +319,27 @@ const guacServer = new GuacamoleLite(
 );
 
 let active = 0;
-guacServer.on('open', () => { active += 1; metrics.activeSessions.set(active); });
+guacServer.on('open', (conn) => {
+  active += 1;
+  metrics.activeSessions.set(active);
+  // Hand the live connection to the lock, so it can watch for input and close
+  // it on idle or takeover. Keyed by target: the lock allows one per desktop.
+  const s = conn.connectionSettings && conn.connectionSettings.connection;
+  if (s) sessions.attach(sessions.targetKey(s.hostname, s.port), conn);
+});
 guacServer.on('close', () => { active = Math.max(0, active - 1); metrics.activeSessions.set(active); });
 guacServer.on('error', (conn, err) => {
   metrics.errors.inc({ kind: 'guacd' });
   log.warn('guacd connection error', { error: err && err.message ? err.message : String(err) });
 });
+
+// Server-side, so an unattended tab cannot hold a desktop: the browser warns
+// first, but this is what actually ends it.
+setInterval(() => {
+  for (const e of sessions.sweepIdle(config.idleTimeoutMs)) {
+    log.info('session closed for inactivity', { user: e.identity.email, via: e.identity.via, target: e.target });
+  }
+}, Math.min(10_000, Math.max(1000, config.idleTimeoutMs / 4 || 10_000))).unref();
 
 server.listen(config.port, () => {
   log.info('listening', {

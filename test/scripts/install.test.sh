@@ -65,6 +65,7 @@ K1=$(kv TOKEN_ENCRYPTION_KEY)
 [ "$(stat -c %a $D/.env)" = 600 ] && ok ".env is 600" || no ".env mode $(stat -c %a $D/.env)"
 [ "$(stat -c '%a %u' $D/connections.json)" = "600 1000" ] && ok "connections.json is 600, owned by the app's uid" || no "connections.json $(stat -c '%a %u' $D/connections.json)"
 [ "$(stat -c '%a %u' $D/recordings)" = "700 1000" ] && ok "recordings/ is 700, owned by guacd's uid" || no "recordings $(stat -c '%a %u' $D/recordings)"
+[ "$(stat -c '%a %u' $D/data)" = "700 1000" ] && ok "data/ (profiles) is 700, owned by the app's uid" || no "data $(stat -c '%a %u' $D/data)"
 saw "build is told the commit" "$(cat /tmp/compose.log)" "VNCGW_COMMIT=$(git -C $D rev-parse --short HEAD)"
 saw "host guard self-check runs" "$out" "unknown hostnames refused (421)"
 saw "no public hostname: says LAN only" "$out" "LAN only"

@@ -25,6 +25,35 @@ token itself. See [docs/REMOTE-ACCESS.md](docs/REMOTE-ACCESS.md).
 
 ---
 
+## Using it
+
+The page is one list of desktops:
+
+- **Shared desktops** come from `connections.json` on the gateway. One click
+  connects; the password lives on the server.
+- **Your kept profiles**. Type an address under *New connection* and press
+  **Keep profile** to save its name, address and port on the gateway -- never
+  the password. Clicking a profile asks for the password, then connects. Each
+  Cloudflare Access user has their own profiles; the LAN shares one list.
+  Profiles follow you between devices, and between the LAN address and the
+  public hostname.
+
+While connected: **Fit / 1:1**, **Clipboard** (both directions), **Fullscreen**,
+**Ctrl-Alt-Del**, **Disconnect**. If a session drops, a dialog offers
+**Reconnect** (no retyping) or **Back to list**. Fit/1:1 and the last desktop
+you used are remembered per browser.
+
+**One session per desktop.** If someone else has a desktop open, it shows *In
+use since ...* and cannot be opened. If *you* have it open in another window,
+opening it again takes it over and the other window is told so -- there are
+never two sessions on one machine.
+
+**Idle sessions are closed** after `IDLE_TIMEOUT_MINUTES` (default 15) without
+mouse or keyboard input, so a forgotten tab does not hold a desktop. The page
+warns first and offers *Stay connected*.
+
+---
+
 ## Security model
 
 Every layer is independent; none relies on another being configured right.
@@ -116,9 +145,10 @@ LAN users are trusted and see everything. Restart after editing:
 | `HOST_PORT` | `8088` | Port on the LXC. |
 | `ALLOWED_HOSTS` | container name | LAN hostnames besides IPs and `localhost`. |
 | `ACCESS_HOSTS` / `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD` | empty | Public hostname behind Cloudflare Access. All three or none. Set via `update-lxc.sh --access-*`. |
-| `ALLOWED_CIDRS` | the LXC's subnet | Free-form targets. Empty disables the feature. |
+| `ALLOWED_CIDRS` | the LXC's subnet | Free-form targets and kept profiles. Empty disables both. |
 | `ALLOWED_PORTS` | `5900,5901` | Free-form target ports. |
 | `SESSION_TTL_SECONDS` | `60` | Life of an unused session handle. |
+| `IDLE_TIMEOUT_MINUTES` | `15` | Close a session after this long without input. `0` = never. |
 | `SESSIONS_PER_MINUTE` | `20` | Per user (Access) or per address (LAN). |
 | `RECORDING` | `0` | `1` records every session into `recordings/`. |
 | `LOG_LEVEL` | `info` | |
@@ -154,7 +184,15 @@ Register it with the monitoring stack once per node (homelab-monitoring):
 `errors_total{kind}` kinds: `host_rejected`, `access_no_token`, `access_denied`,
 `access_unconfigured`, `access_keys_unavailable`, `csrf_rejected`,
 `origin_rejected`, `sid_rejected`, `rate_limited`, `connection_denied`,
-`allowlist_denied`, `guacd`, `not_ready`, `internal`.
+`allowlist_denied`, `target_busy`, `guacd`, `not_ready`, `internal`.
+
+**Kept profiles** live in `/opt/vnc-gateway/data/profiles.json` (name, host,
+port per user; no passwords). It is the only state the app writes; include it in
+backups if you care about the list.
+
+The one-session lock compares the address as written, so an IP and a hostname
+for the same machine count as two desktops. Keep `connections.json` on IP
+addresses to make it reliable.
 
 **Recordings** — with `RECORDING=1`, guacd writes one file per session into
 `/opt/vnc-gateway/recordings/` (Guacamole protocol dumps; convert to video with
@@ -167,8 +205,8 @@ on screen. Nothing deletes them automatically.
 
 | | |
 |---|---|
-| `bash test/run-unit.sh` | 42 unit + integration tests: allowlist, sessions, Access JWT (valid, wrong audience/issuer, expired, unknown key, foreign key, `alg:none`), host guard, CSRF, WebSocket gates, rate limiting, logs. Boots the real server. |
-| `bash test/e2e/run.sh` | Real Chromium → app → guacd → a real VNC server, on the production compose file: pixels, fit-to-window scaling, mouse mapping, keyboard, clipboard both ways, recording, metrics, CSP. |
+| `bash test/run-unit.sh` | 61 unit + integration tests: allowlist, sessions, Access JWT (valid, wrong audience/issuer, expired, unknown key, foreign key, `alg:none`), host guard, CSRF, WebSocket gates, rate limiting, profiles (never a password, per-user), the one-session lock, idle sweep, logs. Boots the real server. |
+| `bash test/e2e/run.sh` | Real Chromium → app → guacd → a real VNC server, on the production compose file: pixels, fit-to-window scaling, mouse mapping, keyboard, clipboard both ways, keep profile → connect, takeover and Reconnect across two windows, remembered prefs, idle close, recording, metrics, CSP. |
 | `bash test/run-scripts.sh` | `create-lxc.sh`, `update-lxc.sh`, `setup-oci.sh` and `install.sh` against stubbed Proxmox / OCI hosts, plus shellcheck. |
 
 All need only Docker.
@@ -179,7 +217,8 @@ All need only Docker.
 
 ```
 src/            server: index (wiring), guard (host + Access), access (JWT),
-                sessions, allowlist, ratelimit, metrics, log, config
+                sessions (handles, one-session lock, idle), profiles,
+                allowlist, ratelimit, metrics, log, config
 public/         the page; guacamole-common-js is wrapped into vendor/ at build
 proxmox/        create-lxc.sh, update-lxc.sh   (run on the Proxmox host)
 oci/            setup-oci.sh                   (run on the OCI tunnel host)

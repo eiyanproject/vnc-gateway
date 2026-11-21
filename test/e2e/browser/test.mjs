@@ -118,6 +118,77 @@ try {
     check(!head.includes('e2e-pass'), 'recording does not contain the VNC password');
   }
 
+  // ---------------------------------------------------------- keep profile
+  const connected = (p) => waitFor(async () => (await p.textContent('#status')) === 'connected', 20000);
+  const item = (p, name) => p.locator('#desktops li', { hasText: name });
+
+  await page.fill('#name', 'Lab VNC');
+  await page.fill('#host', '172.30.99.10');
+  await page.fill('#port', '5900');
+  await page.fill('#password', 'typed-but-not-kept');
+  await page.click('#keep');
+  check(Boolean(await waitFor(async () => (await item(page, 'Lab VNC').count()) === 1, 5000)), 'Keep profile adds it to the list');
+  check((await item(page, 'Lab VNC').textContent()).includes('172.30.99.10:5900'), 'the profile shows its address');
+  const listed = await (await page.request.get(`${BASE}/api/connections`)).text();
+  check(!listed.includes('typed-but-not-kept'), 'the kept profile carries no password');
+  check((await page.inputValue('#password')) === '', 'the password field is cleared after keeping');
+
+  // ------------------------------------------- connect with a kept profile
+  async function openProfile(p) {
+    await item(p, 'Lab VNC').locator('button.open').click();
+    await item(p, 'Lab VNC').locator('form.pw input').fill('e2e-pass');
+    await item(p, 'Lab VNC').locator('form.pw input').press('Enter');
+  }
+  await openProfile(page);
+  const allDisabled = await page.evaluate(() => [...document.querySelectorAll('#picker button')].every((b) => b.disabled));
+  check(allDisabled, 'every button is disabled while connecting (no double sessions)');
+  check(Boolean(await connected(page)), 'a kept profile connects after asking for the password');
+
+  // ------------------------------------------------ one session per desktop
+  const page2 = await (await browser.newContext({ viewport: { width: 640, height: 480 } })).newPage();
+  page2.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(`[page2] ${m.text()}`); });
+  await page2.goto(BASE);
+  check(Boolean(await waitFor(async () => (await item(page2, 'Lab VNC').textContent()).includes('Open in another window'), 5000)),
+    'the list shows the desktop is already open');
+  await openProfile(page2);
+  check(Boolean(await connected(page2)), 'a second window connects (same person takes over)');
+  check(Boolean(await waitFor(async () => (await page.isVisible('#ended'))
+    && (await page.textContent('#ended-msg')).includes('opened in another window'), 5000)),
+  'the first window is told it was taken over', await page.textContent('#ended-msg'));
+
+  // -------------------------------------------------------------- reconnect
+  await page.click('#reconnect');
+  check(Boolean(await connected(page)), 'Reconnect in the dialog reconnects without retyping the password');
+  check(Boolean(await waitFor(async () => (await page2.isVisible('#ended'))
+    && (await page2.textContent('#ended-msg')).includes('opened in another window'), 5000)),
+  'and the other window is told in turn');
+  await page2.click('#back');
+  check(await page2.isVisible('#picker'), 'Back to list returns to the list');
+  await waitFor(async () => (await item(page2, 'Lab VNC').textContent()).includes('Open in another window'), 3000);
+  await page2.setViewportSize({ width: 900, height: 620 });
+  await page2.screenshot({ path: '/out/list.png' });
+
+  // ------------------------------------------------------------ view prefs
+  await page.click('#scale'); // -> 1:1, remembered
+  await page.reload();
+  check(Boolean(await waitFor(async () => (await page.locator('#desktops li.last').textContent()).includes('Lab VNC'), 5000)),
+    'the last-used desktop is highlighted after a reload');
+  await openProfile(page);
+  check(Boolean(await connected(page)), 'reconnects after a reload');
+  check((await page.textContent('#scale')) === '1:1', '1:1 view is remembered');
+  await page.click('#scale'); // back to Fit
+
+  // ------------------------------------------------------------------ idle
+  // IDLE_TIMEOUT_MINUTES=0.5 in e2e.env: warned at 15 s left, closed at 30 s.
+  check(Boolean(await waitFor(() => page.isVisible('#idle-warning'), 25000)), 'an idle session is warned first');
+  await page.click('#stay');
+  check(!(await page.isVisible('#idle-warning')), '"Stay connected" dismisses the warning');
+  const idleClosed = await waitFor(async () => (await page.isVisible('#ended'))
+    && (await page.textContent('#ended-msg')).includes('without input'), 60000);
+  check(Boolean(idleClosed), 'an idle session is closed by the server, with the reason', await page.textContent('#ended-msg'));
+  check(Boolean(await waitFor(async () => /vncgw_active_sessions 0\b/.test(await (await page.request.get(`${BASE}/metrics`)).text()), 5000)),
+    'and the desktop is free again');
+
   // --------------------------------------------------------------- page
   check(consoleErrors.length === 0, 'no console errors or CSP violations', consoleErrors.join(' | ').slice(0, 500));
 } catch (err) {
